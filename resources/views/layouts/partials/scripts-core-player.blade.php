@@ -475,30 +475,23 @@
             return base + sep + '_cb=' + Date.now();
         }
 
-        // Zero-deadlock helper to completely purge stale audio buffer and mount fresh stream source
-        function resetAndMountStream(audio, freshUrl) {
+        // High-performance live stream mounter: sets fresh stream URL without tearing down DOM nodes or triggering AbortError
+        function mountFreshStream(audio, freshUrl) {
+            if (!audio) return;
             try {
-                audio.pause();
+                if (!audio.paused) {
+                    audio.pause();
+                }
             } catch(e) {}
-            audio.removeAttribute('src');
-            while (audio.firstChild) {
-                audio.removeChild(audio.firstChild);
-            }
-            try {
-                audio.load();
-            } catch(e) {}
-
-            var source = document.createElement('source');
-            source.src = freshUrl;
-            source.type = 'audio/mpeg';
-            audio.appendChild(source);
             audio.src = freshUrl;
-            try {
-                audio.currentTime = 0;
-                audio.load();
-            } catch(e) {}
+            var source = audio.querySelector ? audio.querySelector('source') : null;
+            if (source) {
+                source.src = freshUrl;
+            }
         }
-
+        function resetAndMountStream(audio, freshUrl) {
+            mountFreshStream(audio, freshUrl);
+        }
 
         function savePlayingIntent(shouldPlay) {
             try {
@@ -526,18 +519,21 @@
 
         window.audioInterruptedByDevice = false;
         window._lastAudioDisconnectTime = 0;
-        window.setAudioInterrupted = function(val) {
+        window.setAudioInterrupted = function(val, reason) {
             window.audioInterruptedByDevice = !!val;
             try {
                 if (val) {
                     var nowStr = Date.now().toString();
+                    var r = reason || 'device';
                     window._lastAudioDisconnectTime = Date.now();
                     window.safeLocalStorage.setItem(window.getStationStorageKey('interrupted_by_device'), '1');
                     window.safeLocalStorage.setItem(window.getStationStorageKey('interrupted_time'), nowStr);
                     window.safeLocalStorage.setItem(window.getStationStorageKey('interrupted_disconnect_time'), nowStr);
+                    window.safeLocalStorage.setItem(window.getStationStorageKey('interruption_type'), r);
                 } else {
                     window.safeLocalStorage.removeItem(window.getStationStorageKey('interrupted_by_device'));
                     window.safeLocalStorage.removeItem(window.getStationStorageKey('interrupted_time'));
+                    window.safeLocalStorage.removeItem(window.getStationStorageKey('interruption_type'));
                 }
             } catch(e) {}
         };
@@ -767,9 +763,13 @@
             }
 
             // If audio was paused due to CarPlay / Bluetooth disconnect, do NOT force playback on phone speaker!
-            // Wait for CarPlay / Bluetooth reconnect or explicit user / mediasession action
+            // Wait for CarPlay / Bluetooth reconnect or explicit user / mediasession / call-ended action
             if (window.isAudioInterrupted()) {
-                if (reason.indexOf('reconnect') === -1 && reason.indexOf('mediasession') === -1 && reason.indexOf('user') === -1) {
+                var isAuthorized = (reason.indexOf('reconnect') !== -1 ||
+                                    reason.indexOf('mediasession') !== -1 ||
+                                    reason.indexOf('user') !== -1 ||
+                                    reason.indexOf('call-ended') !== -1);
+                if (!isAuthorized) {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
                     _isRecovering = false;
@@ -876,16 +876,26 @@
         };
 
         window.verifyStreamHealthOnForeground = function(source) {
-            if (_resumeOnGestureArmed) return;
-            if (!window.isIntentStillValid() || window.isAudioInterrupted()) {
-                if (window.isAudioInterrupted()) {
-                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
-                }
-                return;
-            }
+            if (!window.isIntentStillValid() || window.userPaused) return;
 
             var audio = RadioAudio.get();
             if (!audio) return;
+
+            // Handle return from phone call or system interruption
+            if (window.isAudioInterrupted()) {
+                var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+                if (intType === 'call' || intType === 'system' || intType === 'device') {
+                    window.setAudioInterrupted(false);
+                    window.recoverLiveStream('call-ended-' + source);
+                    return;
+                } else if (intType === 'bluetooth') {
+                    // Vehicle was disconnected - keep paused to avoid phone speaker leak
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                    return;
+                }
+            }
+
+            if (_resumeOnGestureArmed) return;
 
             // 1. If audio is paused without error, try direct resume first to preserve gesture token
             if (audio.paused && !audio.error) {
@@ -1080,29 +1090,16 @@
                     return;
                 }
 
-                // 2. Involuntary pause while intent is active (connection drop, stall, or route disconnect)
+                // 2. Involuntary pause while intent is active (e.g. vehicle disconnect, phone call):
                 if (window.isIntentStillValid()) {
-                    // Physical route disconnect (CarPlay or Bluetooth headphones disconnected)
-                    if (window.isAudioInterrupted()) {
-                        window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
-                        window.hideReconnectingDialogue();
-                        if ('mediaSession' in navigator) {
-                            try {
-                                navigator.mediaSession.playbackState = 'paused';
-                            } catch(e) {}
-                        }
-                        return;
-                    }
-
-                    var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
-                    if (!isOnline) {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
-                        window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
-                    } else {
-                        // Stream dropout or network blip — DO NOT set isAudioInterrupted(true)!
-                        // Immediately show reconnecting dialogue and auto-recover!
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                        window.recoverLiveStream('involuntary-pause');
+                    var isKnownBt = window.audioInterruptedByDevice;
+                    window.setAudioInterrupted(true, isKnownBt ? 'bluetooth' : 'call');
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                    window.hideReconnectingDialogue();
+                    if ('mediaSession' in navigator) {
+                        try {
+                            navigator.mediaSession.playbackState = 'paused';
+                        } catch(e) {}
                     }
                 } else {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -1213,15 +1210,13 @@
                 var isAudioActuallyPlaying = window.isRealAudioPlaying ? window.isRealAudioPlaying() : (!RadioAudio.paused());
 
                 // 1. DISCONNECT DETECTION:
-                // Device count decreased, OR route change fired while audio was playing.
-                // In iOS Safari, when CarPlay/Bluetooth is disconnected, route shifts to phone speaker.
-                // It MUST pause immediately so audio never blasts on phone speaker!
-                var isDisconnect = (currentCount < prevCount) || (isAudioActuallyPlaying && source === 'devicechange');
+                // Audio device disconnected (currentCount < prevCount, or route shifted while playing)
+                var isDisconnect = (currentCount < prevCount) || (isAudioActuallyPlaying && source === 'devicechange' && currentCount <= prevCount);
 
                 if (isDisconnect) {
                     clearTimeout(_resumeDebounceTimer);
                     window.userPaused = false; // preserve intent to resume when reconnected
-                    window.setAudioInterrupted(true);
+                    window.setAudioInterrupted(true, 'bluetooth');
                     RadioAudio.pause();
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     if ('mediaSession' in navigator) {
@@ -1234,11 +1229,8 @@
                 }
 
                 // 2. RECONNECT DETECTION:
-                // Reconnection to CarPlay / Bluetooth occurs when:
-                // a) Device count increased (external audio hardware connected)
-                // b) OR playback was interrupted by CarPlay AND > 3000ms have passed since disconnect
-                var timeSinceDisconnect = now - window.getLastAudioDisconnectTime();
-                var isReconnect = (currentCount > prevCount) || (window.isAudioInterrupted() && timeSinceDisconnect > 3000);
+                // Reconnection to vehicle/headphones occurs when audio device count INCREASES
+                var isReconnect = (currentCount > prevCount);
 
                 if (isReconnect && window.isAudioInterrupted() && window.isIntentStillValid()) {
                     clearTimeout(_resumeDebounceTimer);
@@ -1247,9 +1239,9 @@
                             window.setAudioInterrupted(false);
                             window.userPaused = false;
                             savePlayingIntent(true);
-                            window.recoverLiveStream('carplay-reconnected-' + source);
+                            window.recoverLiveStream('vehicle-reconnected-' + source);
                         }
-                    }, 1000);
+                    }, 800);
                 }
             }).catch(function(err) {
                 _isCheckingRouteChange = false;

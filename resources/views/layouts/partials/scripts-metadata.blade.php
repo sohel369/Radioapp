@@ -2227,34 +2227,8 @@
                         console.error('Audio element error:', audio.error);
                     };
 
-                    // Check for metadata updates
+                    // Configure seek guards on MediaSession without clobbering play/pause handlers
                     if ('mediaSession' in navigator) {
-                        navigator.mediaSession.setActionHandler('play', () => {
-                            window.userPaused = false;
-                            if (typeof window.setAudioInterrupted === 'function') window.setAudioInterrupted(false);
-                            if (typeof savePlayingIntent === 'function') savePlayingIntent(true);
-                            if (typeof window.recoverLiveStream === 'function') {
-                                window.recoverLiveStream('mediasession-play');
-                            } else if (typeof window.toggleLiveAudio === 'function') {
-                                window.toggleLiveAudio(true);
-                            } else if (audio && audio.play) {
-                                audio.play().catch(e => {});
-                            }
-                        });
-                        navigator.mediaSession.setActionHandler('pause', () => {
-                            window.userPaused = true;
-                            if (typeof window.setAudioInterrupted === 'function') window.setAudioInterrupted(false);
-                            if (typeof savePlayingIntent === 'function') savePlayingIntent(false);
-                            if (typeof RadioAudio !== 'undefined' && RadioAudio.pause) {
-                                RadioAudio.pause();
-                            } else if (audio && audio.pause) {
-                                audio.pause();
-                            }
-                            if (typeof window.setPlayerState === 'function' && window.PLAYER_STATE) {
-                                window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
-                            }
-                        });
-
                         if (typeof window.configureLiveMediaSessionActions === 'function') {
                             window.configureLiveMediaSessionActions();
                         }
@@ -2464,48 +2438,7 @@
             //   • The user was playing before (jammin_was_playing === '1')
             //   • The user did NOT intentionally pause (userPaused === false)
             //   • The tab was NOT closed and reopened (jammin_tab_closed_at not set)
-            function handlePageResume(reason = 'unknown') {
-                if (userPaused || window.userPaused) {
-                    return;
-                }
-
-                const liveAudio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
-                const isActivelyPlaying = liveAudio && !liveAudio.paused && liveAudio.readyState >= 2 && !liveAudio.error;
-
-                if (isActivelyPlaying) {
-                    if (typeof window.reassertMediaSessionMetadata === 'function') {
-                        window.reassertMediaSessionMetadata();
-                    }
-                    if (typeof window.reassertLiveMediaPosition === 'function') {
-                        window.reassertLiveMediaPosition(`page-resume:${reason}`);
-                    }
-                    return;
-                }
-
-                const wasPlaying = (window.safeLocalStorage.getItem(window.getStationStorageKey('was_playing')) === '1') ||
-                                   (window.safeLocalStorage.getItem(window.getStationStorageKey('playing_intent')) === '1');
-
-                if (wasPlaying && !userPaused && !window.userPaused) {
-                    if (typeof window.recoverLiveStream === 'function') {
-                        window.recoverLiveStream('page-resume:' + reason);
-                    } else if (window._smartPlayer && typeof window._smartPlayer.resume === 'function') {
-                        window._smartPlayer.resume();
-                    } else if (typeof window.toggleLiveAudio === 'function') {
-                        window.toggleLiveAudio(true);
-                    } else if (liveAudio) {
-                        liveAudio.play().catch(e => console.warn('[Auto-resume] play() failed:', e.message));
-                    }
-                }
-            }
-
-            // Layer 1: Bluetooth devicechange detection
-            if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
-                navigator.mediaDevices.addEventListener('devicechange', function () {
-                    // Small delay to allow OS to stabilize audio routing
-                    setTimeout(() => handlePageResume('devicechange'), 1500);
-                });
-            }
-
+            // Metadata synchronization on visibilitychange and focus (Audio routing handled by scripts-core-player)
             document.addEventListener('visibilitychange', function () {
                 if (!document.hidden) {
                     // Only claim and re-assert if we weren't already the owner
@@ -2513,9 +2446,6 @@
                     if (!wasAlreadyOwner) {
                         _claimMediaOwnership();
                     }
-
-                    // Layer 2: Auto-resume on visibility
-                    handlePageResume('visibilitychange');
 
                     if (window._storedMediaMetadata && navigator.mediaSession) {
                         const currentSessionTitle = navigator.mediaSession.metadata?.title;
@@ -2531,9 +2461,6 @@
                             window.safeLocalStorage.setItem(window.getStationStorageKey('was_playing'), '1');
                         } catch(e) {}
                     }
-                    // CRITICAL: We no longer set _isActiveMediaTab = false here.
-                    // A tab remains the owner even in the background until another tab claims it.
-                    // This allows lock-screen metadata updates to work while paused/backgrounded.
                 }
             });
 
@@ -2544,9 +2471,6 @@
                     _claimMediaOwnership();
                 }
 
-                // Layer 2: Auto-resume on focus
-                handlePageResume('focus');
-
                 if (window._storedMediaMetadata && navigator.mediaSession) {
                     const currentSessionTitle = navigator.mediaSession.metadata?.title;
                     if (currentSessionTitle !== window._storedMediaMetadata.title) {
@@ -2555,8 +2479,6 @@
                     }
                 }
             });
-
-            // Layer 3: Periodic safety-net poll for BT reconnect has been removed.
 
             // --- Unified Player Initialization ---
             try {

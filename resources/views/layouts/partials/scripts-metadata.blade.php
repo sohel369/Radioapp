@@ -160,13 +160,21 @@
     function _syncMediaSessionPlaybackState() {
         if (!('mediaSession' in navigator)) return;
         try {
+            if (window.userPaused) {
+                navigator.mediaSession.playbackState = 'paused';
+                return;
+            }
+
             const _a = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
             if (!_a) {
                 navigator.mediaSession.playbackState = 'none';
                 return;
             }
 
-            if (!_a.paused && !_a.ended && !_a.error) {
+            const isValidIntent = (typeof window.isIntentStillValid === 'function') ? window.isIntentStillValid() : true;
+            if (isValidIntent && !window.userPaused) {
+                navigator.mediaSession.playbackState = 'playing';
+            } else if (!_a.paused && !_a.ended && !_a.error) {
                 navigator.mediaSession.playbackState = 'playing';
             } else {
                 navigator.mediaSession.playbackState = 'paused';
@@ -180,7 +188,16 @@
     window.reassertMediaSessionMetadata = function (force) {
         if (!('mediaSession' in navigator)) return;
         try {
-            let meta = window._storedMediaMetadata || window._pendingMediaMetadata;
+            if (window._mediaMetadataTimer) {
+                clearTimeout(window._mediaMetadataTimer);
+                window._mediaMetadataTimer = null;
+            }
+            if (window._pendingMediaMetadata) {
+                _flushMediaSession();
+                return;
+            }
+
+            let meta = window._storedMediaMetadata;
             if (!meta) {
                 const artistEl = document.getElementById('current-artist');
                 const titleEl = document.getElementById('current-title');
@@ -244,6 +261,13 @@
             console.warn('reassertMediaSessionMetadata error:', e);
         }
     };
+
+    // Initialize MediaSession with station metadata immediately on script parse
+    if ('mediaSession' in navigator) {
+        try {
+            window.reassertMediaSessionMetadata(true);
+        } catch(e) {}
+    }
 
     // ── SINGLE-POINT-OF-TRUTH: Debounced MediaSession metadata commit ──────────
     window._pendingMediaMetadata = null;
@@ -325,6 +349,7 @@
         
         _syncMediaSessionPlaybackState();
     }
+    window._flushMediaSession = _flushMediaSession;
 
     // ── iOS MediaSession Artwork Handling ──────────────────────────────────────────
     // Store the resized 1024x1024 data URL in localStorage for iOS lock screen.
@@ -1493,16 +1518,16 @@
                                             }
                                         });
 
-                                        if (artworkUrl.jpg1024) {
-                                            window.safeLocalStorage.removeItem(window.getStationStorageKey('ios_current_artwork'));
-                                            const base64Art = await window.storeArtworkForIOS(artworkUrl.jpg1024);
-                                            if (base64Art) {
-                                                finalArtworkArray.unshift({ src: base64Art, sizes: '1024x1024', type: 'image/jpeg' });
-                                            }
-                                        }
-
-                                        // IMMEDIATE flush — authoritative iTunes artwork
+                                        // IMMEDIATE flush — authoritative iTunes artwork (clean HTTPS URLs)
                                         updateSessionMetadata(finalArtworkArray, true);
+
+                                        // Background cache for iOS (non-blocking, no base64 in MediaMetadata)
+                                        if (artworkUrl.jpg1024) {
+                                            try {
+                                                window.safeLocalStorage.removeItem(window.getStationStorageKey('ios_current_artwork'));
+                                                window.storeArtworkForIOS(artworkUrl.jpg1024);
+                                            } catch (e) {}
+                                        }
                                         return;
                                     }
 
@@ -2599,13 +2624,31 @@
                         }
                     }
                 } else {
+                    // Page entering background / screen lock
+                    // Flush any pending debounced metadata IMMEDIATELY so it isn't throttled by background timer limits
+                    if (window._mediaMetadataTimer || window._pendingMediaMetadata) {
+                        if (window._mediaMetadataTimer) {
+                            clearTimeout(window._mediaMetadataTimer);
+                            window._mediaMetadataTimer = null;
+                        }
+                        if (typeof _flushMediaSession === 'function') {
+                            _flushMediaSession();
+                        }
+                    }
+
                     const liveAudio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
-                    if (liveAudio && !liveAudio.paused) {
+                    const isIntendedPlaying = (typeof window.isIntentStillValid === 'function') 
+                        ? (window.isIntentStillValid() && !window.userPaused) 
+                        : (liveAudio && !liveAudio.paused);
+
+                    if (isIntendedPlaying) {
                         try {
                             window.safeLocalStorage.setItem(window.getStationStorageKey('was_playing'), '1');
                         } catch(e) {}
                         if ('mediaSession' in navigator) {
-                            navigator.mediaSession.playbackState = 'playing';
+                            try {
+                                navigator.mediaSession.playbackState = 'playing';
+                            } catch(e) {}
                             if (typeof window.reassertMediaSessionMetadata === 'function') {
                                 window.reassertMediaSessionMetadata(true);
                             }

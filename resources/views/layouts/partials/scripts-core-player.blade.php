@@ -506,9 +506,11 @@
             return base + sep + '_cb=' + Date.now();
         }
 
+        var _isSwitchingSource = false;
         // High-performance live stream mounter: assigns fresh timestamped URL without tearing down media authorization
         function mountFreshStream(audio, freshUrl) {
             if (!audio) return;
+            _isSwitchingSource = true;
             try {
                 if (!audio.paused) {
                     audio.pause();
@@ -524,6 +526,12 @@
             if (source) {
                 source.src = freshUrl;
             }
+            try {
+                audio.load();
+            } catch(e) {}
+            setTimeout(function() {
+                _isSwitchingSource = false;
+            }, 300);
         }
         function resetAndMountStream(audio, freshUrl) {
             mountFreshStream(audio, freshUrl);
@@ -704,6 +712,16 @@
 
                 window.setPlayerState(window.PLAYER_STATE.LOADING, "Connecting to stream...");
 
+                // Establish MediaSession immediately during user click gesture so OS notification / lock screen appears right away
+                if ('mediaSession' in navigator) {
+                    try {
+                        navigator.mediaSession.playbackState = 'playing';
+                    } catch(e) {}
+                }
+                if (typeof window.reassertMediaSessionMetadata === 'function') {
+                    window.reassertMediaSessionMetadata(true);
+                }
+
                 // Completely purge existing buffer to ensure no stale seconds replay
                 var freshUrl = getStreamUrl();
                 resetAndMountStream(audio, freshUrl);
@@ -794,15 +812,23 @@
         var _maxAutoReconnectAttempts = 20;
 
         function getReconnectBackoff(attempt) {
-            if (attempt <= 1) return 800;
-            if (attempt <= 3) return 1500;
-            if (attempt <= 6) return 3000;
-            return 5000;
+            if (attempt <= 1) return 1500;
+            if (attempt <= 3) return 2500;
+            if (attempt <= 6) return 4000;
+            return 6000;
         }
 
         window.recoverLiveStream = function(reason) {
             var now = Date.now();
-            if (_isRecovering && (now - _lastRecoveryAttempt < 2500)) return;
+            var isUserAction = (reason.indexOf('user') !== -1 ||
+                                reason.indexOf('mediasession') !== -1 ||
+                                reason.indexOf('vehicle-reconnected') !== -1);
+
+            // Throttle automatic recovery triggers so multiple events don't tear down the socket
+            if (!isUserAction) {
+                if (_isRecovering) return;
+                if (now - _lastRecoveryAttempt < 2500) return;
+            }
 
             if (!window.isIntentStillValid() || window.userPaused) {
                 window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -810,6 +836,12 @@
                 SilentCarrierAudio.stop();
                 _isRecovering = false;
                 return;
+            }
+
+            // Cancel any pending reconnect timer so multiple loops never run concurrently
+            if (_reconnectTimer) {
+                clearTimeout(_reconnectTimer);
+                _reconnectTimer = null;
             }
 
             // Ensure background keepalive audio carrier is active
@@ -857,7 +889,7 @@
             clearTimeout(_recoverySafetyTimer);
             _recoverySafetyTimer = setTimeout(function() {
                 _isRecovering = false;
-            }, 4500);
+            }, 5000);
 
             var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
 
@@ -887,6 +919,7 @@
                     _isRecovering = false;
                     _reconnectAttempts = 0;
                     clearTimeout(_reconnectTimer);
+                    _reconnectTimer = null;
                     clearTimeout(_recoverySafetyTimer);
                     _resumeOnGestureArmed = false;
                     SilentCarrierAudio.start();
@@ -894,13 +927,19 @@
                     audioPersistenceManager.saveAudioState();
                     window.setPlayerState(window.PLAYER_STATE.PLAYING);
                     window.showReconnectingDialogue("Connected!", "Live stream resumed.", "success");
+                    if ('mediaSession' in navigator) {
+                        try {
+                            navigator.mediaSession.playbackState = 'playing';
+                        } catch(e) {}
+                    }
                     if (typeof window.reassertMediaSessionMetadata === 'function') {
-                        window.reassertMediaSessionMetadata();
+                        window.reassertMediaSessionMetadata(true);
                     }
                     requestPlayerWakeLock();
                 }).catch(function(err) {
                     console.warn('⚠️ [LiveStreamWatchdog] Reconnect attempt rejected/failed (' + reason + '):', err);
                     _isRecovering = false;
+                    _lastRecoveryAttempt = Date.now();
 
                     if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
                         console.warn('⚠️ [LiveStreamWatchdog] Autoplay restricted on attempt (' + reason + ')');
@@ -947,6 +986,7 @@
                 _isRecovering = false;
                 _reconnectAttempts = 0;
                 clearTimeout(_reconnectTimer);
+                _reconnectTimer = null;
                 clearTimeout(_recoverySafetyTimer);
                 SilentCarrierAudio.start();
                 window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
@@ -1148,6 +1188,9 @@
             });
 
             liveAudio.addEventListener('pause', function() {
+                if (_isSwitchingSource) {
+                    return; // Ignore internal pause during source swap
+                }
                 audioPersistenceManager.saveAudioState();
                 releasePlayerWakeLock();
 
@@ -1191,10 +1234,13 @@
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
                         window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
                     } else {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                        window.showReconnectingDialogue("Buffering...", "Reconnecting to live stream...", "reconnecting");
+                        var now = Date.now();
+                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                            window.showReconnectingDialogue("Buffering...", "Reconnecting to live stream...", "reconnecting");
+                            window.recoverLiveStream('stream-paused-network-starvation');
+                        }
                     }
-                    window.recoverLiveStream('stream-paused-network-starvation');
                 } else {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
@@ -1209,8 +1255,11 @@
             liveAudio.addEventListener('stalled', function() {
                 if (window.isIntentStillValid() && !window.userPaused) {
                     console.warn('⚠️ [SmartPlayer] Stream stalled event detected.');
-                    window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                    window.recoverLiveStream('stalled');
+                    var now = Date.now();
+                    if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                        window.recoverLiveStream('stalled');
+                    }
                 }
             });
 
@@ -1222,17 +1271,23 @@
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
                         window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
                     } else {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                        var now = Date.now();
+                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                            window.recoverLiveStream('error');
+                        }
                     }
-                    window.recoverLiveStream('error');
                 }
             });
 
             liveAudio.addEventListener('ended', function() {
                 console.warn('⚠️ [SmartPlayer] Stream ended unexpectedly.');
                 if (window.isIntentStillValid() && !window.userPaused) {
-                    window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                    window.recoverLiveStream('ended');
+                    var now = Date.now();
+                    if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                        window.recoverLiveStream('ended');
+                    }
                 }
             });
 
@@ -1241,11 +1296,14 @@
                 liveAudio._waitingTimeout = setTimeout(function() {
                     if (window.isIntentStillValid() && !window.userPaused && (!window.isRealAudioPlaying() || liveAudio.readyState < 3)) {
                         console.warn('⚠️ [SmartPlayer] Audio waiting timeout (buffer exhausted).');
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
-                        window.showReconnectingDialogue("Buffering Stream", "Recovering audio connection...", "reconnecting");
-                        window.recoverLiveStream('waiting-timeout');
+                        var now = Date.now();
+                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
+                            window.showReconnectingDialogue("Buffering Stream", "Recovering audio connection...", "reconnecting");
+                            window.recoverLiveStream('waiting-timeout');
+                        }
                     }
-                }, 2000);
+                }, 3000);
             });
         }
         initAudio();
@@ -1257,21 +1315,24 @@
                 window.startMetadataUpdates();
             }
             if (window.isIntentStillValid() && !window.userPaused) {
-                console.log('🌐 [SmartPlayer] Network online event fired — resuming stream immediately.');
+                console.log('🌐 [SmartPlayer] Network online event fired — waiting for cellular routing to stabilize.');
                 window.showReconnectingDialogue("Internet Restored", "Reconnecting to live stream...", "reconnecting");
                 _resumeOnGestureArmed = false;
-                _isRecovering = false;
-                _reconnectAttempts = 0;
                 clearTimeout(_reconnectTimer);
                 clearTimeout(_recoverySafetyTimer);
                 SilentCarrierAudio.start();
 
-                setTimeout(function() {
+                if (window._onlineRecoverTimer) {
+                    clearTimeout(window._onlineRecoverTimer);
+                }
+                window._onlineRecoverTimer = setTimeout(function() {
+                    window._onlineRecoverTimer = null;
                     if (window.isIntentStillValid() && !window.userPaused) {
                         _isRecovering = false;
+                        _lastRecoveryAttempt = 0; // Authorized recovery after stabilization
                         window.recoverLiveStream('network-online-restored');
                     }
-                }, 300);
+                }, 900);
             }
         });
 

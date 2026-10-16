@@ -833,10 +833,31 @@
             // Ensure background keepalive audio carrier is active
             SilentCarrierAudio.start();
 
-            // If audio was paused due to CarPlay / Bluetooth disconnect, do NOT force playback on phone speaker!
-            // Wait for CarPlay / Bluetooth reconnect or explicit user / mediasession / call-ended action
+            // If audio was paused due to CarPlay / Bluetooth disconnect or ongoing Phone Call,
+            // do NOT force playback into call audio or phone speaker!
             if (window.isAudioInterrupted()) {
                 var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+
+                // If phone call is in progress, ONLY allow recovery if call has ended or user clicked play!
+                if (intType === 'call') {
+                    var isCallResume = (reason.indexOf('call-ended') !== -1 || reason.indexOf('user') !== -1 || reason.indexOf('mediasession') !== -1);
+                    if (!isCallResume) {
+                        console.log('📞 [SmartPlayer] Refusing recovery (' + reason + ') while phone call is active.');
+                        window.setPlayerState(window.PLAYER_STATE.PAUSED, "Call in progress...");
+                        window.hideReconnectingDialogue();
+                        _isRecovering = false;
+                        return;
+                    }
+                }
+
+                // If confirmed Bluetooth physical disconnect, only allow recovery if vehicle reconnected or user/mediasession action
+                if (intType === 'bluetooth' && (reason.indexOf('vehicle-reconnected') === -1 && reason.indexOf('user') === -1 && reason.indexOf('mediasession') === -1)) {
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                    window.hideReconnectingDialogue();
+                    _isRecovering = false;
+                    return;
+                }
+
                 var isAuthorized = (reason.indexOf('reconnect') !== -1 ||
                                     reason.indexOf('mediasession') !== -1 ||
                                     reason.indexOf('user') !== -1 ||
@@ -849,14 +870,6 @@
                                     reason.indexOf('watchdog') !== -1 ||
                                     reason.indexOf('starvation') !== -1 ||
                                     reason.indexOf('ping') !== -1);
-
-                // If confirmed Bluetooth physical disconnect, only allow recovery if vehicle reconnected or user/mediasession action
-                if (intType === 'bluetooth' && (reason.indexOf('vehicle-reconnected') === -1 && reason.indexOf('user') === -1 && reason.indexOf('mediasession') === -1)) {
-                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
-                    window.hideReconnectingDialogue();
-                    _isRecovering = false;
-                    return;
-                }
 
                 if (!isAuthorized) {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -1224,19 +1237,30 @@
                     return;
                 }
 
-                // 3. Network buffer starvation / cellular toggle in background:
-                // Keep SilentCarrierAudio running so iOS doesn't freeze the tab!
-                // Do NOT call recoverLiveStream here; allow browser to buffer naturally or await online event.
-                if (window.isIntentStillValid()) {
-                    SilentCarrierAudio.start();
-                    var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
-                    if (!isOnline) {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
-                        window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
-                    } else {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
-                        window.showReconnectingDialogue("Buffering...", "Buffering live stream...", "reconnecting");
+                // 3. System audio interruption (phone call, Siri, system prompt):
+                // On mobile (iOS / Android), when a call begins or rings, the OS forcibly pauses media.
+                // We MUST mark the interruption as 'call', pause playback cleanly, and NEVER attempt
+                // to restart or recover audio while the phone call is active!
+                var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
+                if (isOnline && window.isIntentStillValid()) {
+                    console.log('📞 [SmartPlayer] Audio paused by OS (phone call or system interruption). Suspending playback during call.');
+                    window.setAudioInterrupted(true, 'call');
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Call in progress...");
+                    window.hideReconnectingDialogue();
+                    SilentCarrierAudio.stop();
+                    if ('mediaSession' in navigator) {
+                        try {
+                            navigator.mediaSession.playbackState = 'paused';
+                        } catch(e) {}
                     }
+                    return;
+                }
+
+                // 4. Offline (network lost while playing)
+                if (window.isIntentStillValid()) {
+                    window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
+                    window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
+                    SilentCarrierAudio.stop();
                 } else {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
@@ -1401,21 +1425,25 @@
                     return;
                 }
 
-                // 2. RECONNECT DETECTION:
-                // Reconnection to vehicle/headphones occurs when audio device count INCREASES
+                // 2. RECONNECT / CALL END DETECTION:
+                // Reconnection to vehicle/headphones occurs when audio device count INCREASES, or when phone call ends
                 var isReconnect = (currentCount > prevCount);
 
-                if (isReconnect && window.isAudioInterrupted() && window.isIntentStillValid()) {
-                    clearTimeout(_resumeDebounceTimer);
-                    _resumeDebounceTimer = setTimeout(function() {
-                        if (window.isAudioInterrupted() && window.isIntentStillValid()) {
-                            window.setAudioInterrupted(false);
-                            window.userPaused = false;
-                            savePlayingIntent(true);
-                            SilentCarrierAudio.start();
-                            window.recoverLiveStream('vehicle-reconnected-' + source);
-                        }
-                    }, 800);
+                if (window.isAudioInterrupted() && window.isIntentStillValid()) {
+                    var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+                    if (intType === 'call' || (isReconnect && intType === 'bluetooth')) {
+                        clearTimeout(_resumeDebounceTimer);
+                        _resumeDebounceTimer = setTimeout(function() {
+                            if (window.isAudioInterrupted() && window.isIntentStillValid()) {
+                                var currentInt = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+                                window.setAudioInterrupted(false);
+                                window.userPaused = false;
+                                savePlayingIntent(true);
+                                SilentCarrierAudio.start();
+                                window.recoverLiveStream(currentInt === 'call' ? ('call-ended-' + source) : ('vehicle-reconnected-' + source));
+                            }
+                        }, 1000);
+                    }
                 }
             }).catch(function(err) {
                 _isCheckingRouteChange = false;
@@ -1479,10 +1507,10 @@
                     SilentCarrierAudio.start();
                 }
 
-                // If paused due to verified Bluetooth / CarPlay physical disconnect, stay paused
+                // If paused due to verified Bluetooth disconnect OR active phone call, STAY PAUSED!
                 if (window.isAudioInterrupted()) {
                     var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
-                    if (intType === 'bluetooth') {
+                    if (intType === 'bluetooth' || intType === 'call' || intType === 'system') {
                         if (window._currentPlayerState !== window.PLAYER_STATE.PAUSED) {
                             window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                         }

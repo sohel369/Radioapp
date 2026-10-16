@@ -166,11 +166,7 @@
                 return;
             }
 
-            const isRealPlaying = (typeof window.isRealAudioPlaying === 'function') 
-                ? window.isRealAudioPlaying() 
-                : (!_a.paused && _a.readyState >= 2 && !_a.error);
-
-            if (isRealPlaying) {
+            if (!_a.paused && !_a.ended && !_a.error) {
                 navigator.mediaSession.playbackState = 'playing';
             } else {
                 navigator.mediaSession.playbackState = 'paused';
@@ -219,14 +215,28 @@
                 window._storedMediaMetadata = meta;
             }
 
+            // Sanitize artwork: MUST only contain clean absolute HTTP/HTTPS URLs (no data URIs)
+            let safeArtwork = [];
+            if (meta.artwork && Array.isArray(meta.artwork)) {
+                safeArtwork = meta.artwork.filter(item => item && typeof item.src === 'string' && item.src.startsWith('http'));
+            }
+            if (safeArtwork.length === 0 && window._defaultArtwork) {
+                safeArtwork = window._defaultArtwork;
+            }
+
             try {
-                navigator.mediaSession.metadata = new MediaMetadata(meta);
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: meta.title || 'Live Radio',
+                    artist: meta.artist || _appName,
+                    album: meta.album || getAlbumTitle(),
+                    artwork: safeArtwork
+                });
             } catch (e) {
                 if (navigator.mediaSession.metadata) {
                     navigator.mediaSession.metadata.title = meta.title;
                     navigator.mediaSession.metadata.artist = meta.artist;
                     navigator.mediaSession.metadata.album = meta.album;
-                    navigator.mediaSession.metadata.artwork = meta.artwork;
+                    navigator.mediaSession.metadata.artwork = safeArtwork;
                 }
             }
             _syncMediaSessionPlaybackState();
@@ -279,6 +289,15 @@
         const obj = window._pendingMediaMetadata;
         if (!obj) return;
 
+        // Sanitize artwork: MUST only contain clean absolute HTTP/HTTPS URLs (no data URIs)
+        let safeArtwork = [];
+        if (obj.artwork && Array.isArray(obj.artwork)) {
+            safeArtwork = obj.artwork.filter(item => item && typeof item.src === 'string' && item.src.startsWith('http'));
+        }
+        if (safeArtwork.length === 0 && window._defaultArtwork) {
+            safeArtwork = window._defaultArtwork;
+        }
+
         try {
             // ALWAYS construct a new MediaMetadata instance to guarantee
             // that iOS WebKit (MPNowPlayingInfoCenter) and Android Chrome
@@ -287,7 +306,7 @@
                 title: obj.title || 'Live Stream',
                 artist: obj.artist || '',
                 album: obj.album || '',
-                artwork: obj.artwork || []
+                artwork: safeArtwork
             });
         } catch (e) {
             console.warn('new MediaMetadata assignment error:', e);
@@ -296,13 +315,13 @@
                     navigator.mediaSession.metadata.title = obj.title;
                     navigator.mediaSession.metadata.artist = obj.artist;
                     navigator.mediaSession.metadata.album = obj.album;
-                    navigator.mediaSession.metadata.artwork = obj.artwork;
+                    navigator.mediaSession.metadata.artwork = safeArtwork;
                 } catch (err) {}
             }
         }
         
         window._storedMediaMetadata = obj;
-        window._storedArtworkSrc = (obj.artwork && obj.artwork[0]) ? obj.artwork[0].src : null;
+        window._storedArtworkSrc = (safeArtwork && safeArtwork[0]) ? safeArtwork[0].src : null;
         
         _syncMediaSessionPlaybackState();
     }
@@ -1175,18 +1194,6 @@
                             if (processedArtwork.length === 0) {
                                 if (window._defaultArtwork && window._defaultArtwork.length > 0) {
                                     processedArtwork.push(...window._defaultArtwork);
-
-                                    // Inject base64 default art to prevent OS download delay
-                                    try {
-                                        const cachedDefault = window.safeLocalStorage.getItem(window.getStationStorageKey('ios_default_artwork'));
-                                        if (cachedDefault) {
-                                            processedArtwork.unshift({
-                                                src: cachedDefault,
-                                                sizes: '1024x1024',
-                                                type: 'image/jpeg'
-                                            });
-                                        }
-                                    } catch (e) { }
                                 }
                             }
 

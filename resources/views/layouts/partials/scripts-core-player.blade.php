@@ -101,14 +101,12 @@
                 },
                 play: function() {
                     var a = this.get();
-                    if (typeof SilentCarrierAudio !== 'undefined') {
-                        SilentCarrierAudio.start();
-                    }
                     if (!a || typeof a.play !== 'function') {
                         return (typeof window.Promise !== 'undefined' ? Promise.resolve() : undefined);
                     }
                     try {
                         a.muted = false;
+                        a.volume = 1;
                         var p = a.play();
                         if (p && typeof p.then === 'function') {
                             return p;
@@ -124,9 +122,6 @@
                         try {
                             a.pause();
                         } catch (e) {}
-                    }
-                    if (window.userPaused && typeof SilentCarrierAudio !== 'undefined') {
-                        SilentCarrierAudio.stop();
                     }
                 },
                 setSrc: function(src) {
@@ -152,94 +147,25 @@
             };
         })();
 
-        // iOS Safari background keep-alive silent carrier:
-        // Maintains AVAudioSession active so iOS does not suspend JavaScript execution
-        // when cellular drops while driving / navigating in Google Maps.
-        var SilentCarrierAudio = (function() {
-            var _carrierEl = null;
-            var _blobUrl = null;
-
-            function getCarrierBlobUrl() {
-                if (_blobUrl) return _blobUrl;
-                try {
-                    var sampleRate = 8000;
-                    var numSamples = 4000;
-                    var dataSize = numSamples * 2;
-                    var buffer = new ArrayBuffer(44 + dataSize);
-                    var view = new DataView(buffer);
-                    function writeString(offset, string) {
-                        for (var i = 0; i < string.length; i++) {
-                            view.setUint8(offset + i, string.charCodeAt(i));
-                        }
-                    }
-                    writeString(0, 'RIFF');
-                    view.setUint32(4, 36 + dataSize, true);
-                    writeString(8, 'WAVE');
-                    writeString(12, 'fmt ');
-                    view.setUint32(16, 16, true);
-                    view.setUint16(20, 1, true); // PCM
-                    view.setUint16(22, 1, true); // Mono
-                    view.setUint32(24, sampleRate, true);
-                    view.setUint32(28, sampleRate * 2, true);
-                    view.setUint16(32, 2, true);
-                    view.setUint16(34, 16, true);
-                    writeString(36, 'data');
-                    view.setUint32(40, dataSize, true);
-                    var blob = new Blob([buffer], { type: 'audio/wav' });
-                    _blobUrl = URL.createObjectURL(blob);
-                } catch(e) {
-                    _blobUrl = 'data:audio/wav;base64,UklGRmQfAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAfAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
-                }
-                return _blobUrl;
-            }
-
-            function getElement() {
-                if (!_carrierEl) {
-                    _carrierEl = document.getElementById('silent-carrier-audio');
-                    if (!_carrierEl) {
-                        _carrierEl = document.createElement('audio');
-                        _carrierEl.id = 'silent-carrier-audio';
-                        _carrierEl.setAttribute('playsinline', 'true');
-                        _carrierEl.setAttribute('webkit-playsinline', 'true');
-                        _carrierEl.setAttribute('preload', 'auto');
-                        _carrierEl.loop = true;
-                        _carrierEl.volume = 0.001;
-                        _carrierEl.src = getCarrierBlobUrl();
-                        _carrierEl.style.display = 'none';
-                        (document.body || document.documentElement).appendChild(_carrierEl);
-                    }
-                }
-                return _carrierEl;
-            }
-
-            return {
-                start: function() {
-                    try {
-                        var el = getElement();
-                        if (el && el.paused) {
-                            el.volume = 0.001;
-                            var p = el.play();
-                            if (p && typeof p.catch === 'function') {
-                                p.catch(function(e) {});
-                            }
-                        }
-                    } catch(e) {}
-                },
-                stop: function() {
-                    try {
-                        var el = getElement();
-                        if (el && !el.paused) {
-                            el.pause();
-                        }
-                    } catch(e) {}
-                },
-                isPlaying: function() {
-                    var el = getElement();
-                    return !!(el && !el.paused);
-                }
-            };
-        })();
+        // Neutralized SilentCarrierAudio:
+        // Having a second inaudible audio element running in the background causes
+        // Android Chrome and iOS Safari to drop the lockscreen & home screen Media Notifications!
+        var SilentCarrierAudio = {
+            start: function() {},
+            stop: function() {},
+            isPlaying: function() { return false; }
+        };
         window.SilentCarrierAudio = SilentCarrierAudio;
+        try {
+            var oldCarrier = document.getElementById('silent-carrier-audio');
+            if (oldCarrier) {
+                oldCarrier.pause();
+                oldCarrier.removeAttribute('src');
+                if (oldCarrier.parentNode) {
+                    oldCarrier.parentNode.removeChild(oldCarrier);
+                }
+            }
+        } catch(e) {}
     </script>
     <script>
         // Private / Incognito browsing safe storage polyfill (in-memory fallback)
@@ -1322,6 +1248,8 @@
                 }, 2000);
             });
         }
+        initAudio();
+        setupAudioListeners();
 
         // Immediate network connection recovery listeners
         window.addEventListener('online', function() {

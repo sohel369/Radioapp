@@ -570,7 +570,7 @@
             return base + sep + '_cb=' + Date.now();
         }
 
-        // High-performance live stream mounter: sets fresh stream URL without tearing down DOM nodes or triggering AbortError
+        // High-performance live stream mounter: completely flushes old decoder buffer and mounts fresh live stream
         function mountFreshStream(audio, freshUrl) {
             if (!audio) return;
             try {
@@ -578,10 +578,50 @@
                     audio.pause();
                 }
             } catch(e) {}
+
+            var targetVolume = 1;
+            try {
+                if (typeof audio.volume === 'number' && audio.volume > 0) {
+                    targetVolume = audio.volume;
+                }
+            } catch(e) {}
+
+            // Temporarily mute while mounting fresh stream to eliminate the 1-second stale buffer glitch
+            audio.muted = true;
+
+            // Remove existing child sources so browser media engine completely clears old buffer
+            while (audio.firstChild) {
+                audio.removeChild(audio.firstChild);
+            }
+
             audio.src = freshUrl;
-            var source = audio.querySelector ? audio.querySelector('source') : null;
-            if (source) {
-                source.src = freshUrl;
+            var source = document.createElement('source');
+            source.src = freshUrl;
+            source.type = 'audio/mpeg';
+            audio.appendChild(source);
+
+            // Explicit load() forces WebKit & Chromium to flush the residual decoded buffer and close old socket
+            try {
+                audio.load();
+            } catch(e) {}
+
+            // Unmute cleanly only when genuine fresh live audio data is actively playing
+            var unmuteOnLive = function() {
+                if (audio.removeEventListener) {
+                    audio.removeEventListener('playing', unmuteOnLive);
+                    audio.removeEventListener('timeupdate', unmuteOnLive);
+                    audio.removeEventListener('canplay', unmuteOnLive);
+                }
+                audio.muted = false;
+                try { audio.volume = targetVolume; } catch(e) {}
+            };
+
+            if (audio.addEventListener) {
+                audio.addEventListener('playing', unmuteOnLive);
+                audio.addEventListener('timeupdate', unmuteOnLive);
+                audio.addEventListener('canplay', unmuteOnLive);
+            } else {
+                audio.muted = false;
             }
         }
         function resetAndMountStream(audio, freshUrl) {
@@ -1019,22 +1059,11 @@
 
             if (_resumeOnGestureArmed) return;
 
-            // 1. If audio is paused without error, try direct resume first to preserve gesture token
-            if (audio.paused && !audio.error) {
-                var p = RadioAudio.play();
-                if (p && typeof p.then === 'function') {
-                    p.then(function() {
-                        window.setPlayerState(window.PLAYER_STATE.PLAYING);
-                    }).catch(function(err) {
-                        if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
-                            window.setPlayerState(window.PLAYER_STATE.PLAYING);
-                            armResumeOnFirstInteraction();
-                        } else {
-                            window.recoverLiveStream('foreground-' + source);
-                        }
-                    });
-                    return;
-                }
+            // 1. If audio is paused and user intent is active, do NOT attempt to play the stale buffer!
+            // Live streams cannot be resumed from a dead socket. Mount a fresh live stream immediately:
+            if (audio.paused) {
+                window.recoverLiveStream('foreground-' + source);
+                return;
             }
 
             // 2. If audio has error or network state failed, trigger recovery
@@ -1047,7 +1076,7 @@
             // 3. Check if currentTime advances over 800ms (detects severed HTTP live socket in Chrome)
             var sampleTime = audio.currentTime;
             setTimeout(function() {
-                if (window.isIntentStillValid() && !window.isAudioInterrupted()) {
+                if (window.isIntentStillValid() && !window.isAudioInterrupted() && !window.userPaused) {
                     var currentAudio = RadioAudio.get();
                     if (currentAudio) {
                         if (currentAudio.paused || currentAudio.readyState < 2 || currentAudio.currentTime === sampleTime) {
@@ -1083,7 +1112,7 @@
                 return;
             }
 
-            // 1. If audio is ALREADY playing (e.g. background audio continued or BFCache / HTMX kept playing)
+            // 1. If audio is ALREADY genuinely playing, keep playing
             if (window.isRealAudioPlaying && window.isRealAudioPlaying()) {
                 _resumeOnGestureArmed = false;
                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
@@ -1093,46 +1122,9 @@
                 return;
             }
 
-            // 2. Audio is not currently playing, but user intent is active:
-            // Do NOT pause or tear down the audio element! Direct play preserves gesture token.
-            var hasSource = (audio.src && audio.src.indexOf('http') !== -1) || (audio.querySelector && audio.querySelector('source'));
-            if (!hasSource) {
-                var freshUrl = getStreamUrl();
-                audio.src = freshUrl;
-                var source = document.createElement('source');
-                source.src = freshUrl;
-                source.type = 'audio/mpeg';
-                audio.appendChild(source);
-                try { audio.load(); } catch(e) {}
-            }
-
-            // Keep UI in PLAYING state so user knows radio is intended to play
-            window.setPlayerState(window.PLAYER_STATE.PLAYING);
-
-            var p = RadioAudio.play();
-            if (p && typeof p.then === 'function') {
-                p.then(function() {
-                    _resumeOnGestureArmed = false;
-                    window.setPlayerState(window.PLAYER_STATE.PLAYING);
-                    if (typeof window.reassertMediaSessionMetadata === 'function') {
-                        window.reassertMediaSessionMetadata(true);
-                    }
-                    requestPlayerWakeLock();
-                }).catch(function(err) {
-                    console.warn('⚠️ Audio play on navigation rejected (' + reason + '):', err);
-                    if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
-                        // Radio should ONLY stop if the user explicitly clicked stop! Keep PLAYING state.
-                        window.setPlayerState(window.PLAYER_STATE.PLAYING);
-                        armResumeOnFirstInteraction();
-                    } else {
-                        // Media network/decode error: try live recovery
-                        window.recoverLiveStream('auto-resume-' + reason);
-                    }
-                });
-                return;
-            } else {
-                window.setPlayerState(window.PLAYER_STATE.PLAYING);
-            }
+            // 2. Audio is not playing: mount a fresh live stream instead of attempting to play dead socket
+            window.recoverLiveStream('auto-resume-' + reason);
+            return;
         }
 
         function initAudio() {

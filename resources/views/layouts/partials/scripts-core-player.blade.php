@@ -489,6 +489,9 @@
                 if ('mediaSession' in navigator) {
                     navigator.mediaSession.playbackState = 'playing';
                 }
+                if (typeof window.resumeLiveMediaPosition === 'function') {
+                    window.resumeLiveMediaPosition('setPlayerState-playing');
+                }
 
                 // If reconnecting dialogue was showing, flash green success then fade out
                 var dlg = document.getElementById('stream-reconnecting-dialogue');
@@ -510,6 +513,9 @@
                 if ('mediaSession' in navigator) {
                     navigator.mediaSession.playbackState = 'paused';
                 }
+                if (typeof window.freezeLiveMediaPosition === 'function') {
+                    window.freezeLiveMediaPosition('setPlayerState-reconnecting');
+                }
             } else { // PAUSED, IDLE, ERROR
                 if (navbarPlayIcon) navbarPlayIcon.className = "fas fa-play me-1";
                 if (miniPlayIcon)   miniPlayIcon.className   = "fas fa-play";
@@ -523,6 +529,9 @@
 
                 if ('mediaSession' in navigator) {
                     navigator.mediaSession.playbackState = 'paused';
+                }
+                if (typeof window.freezeLiveMediaPosition === 'function') {
+                    window.freezeLiveMediaPosition('setPlayerState-paused');
                 }
 
                 if (window.userPaused) {
@@ -1312,6 +1321,9 @@
 
         // Immediate network connection recovery listeners
         window.addEventListener('online', function() {
+            if (typeof window.startMetadataUpdates === 'function') {
+                window.startMetadataUpdates();
+            }
             if (window.isIntentStillValid() && !window.userPaused) {
                 console.log('🌐 [SmartPlayer] Network online event fired — resuming stream immediately.');
                 window.showReconnectingDialogue("Internet Restored", "Reconnecting to live stream...", "reconnecting");
@@ -1321,6 +1333,9 @@
         });
 
         window.addEventListener('offline', function() {
+            if (typeof window.freezeLiveMediaPosition === 'function') {
+                window.freezeLiveMediaPosition('network-offline');
+            }
             if (window.isIntentStillValid() && !window.userPaused) {
                 console.log('🌐 [SmartPlayer] Network offline event fired — waiting for network.');
                 window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Offline. Waiting for network...");

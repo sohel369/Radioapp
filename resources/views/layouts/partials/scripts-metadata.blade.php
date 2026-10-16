@@ -631,6 +631,19 @@
             ];
             let fallbackIndex = 0;
 
+            // ── Live streaming active detector ────────────────────────────────────────────
+            function isRealStreamingActive() {
+                const audio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
+                const isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
+                if (!isOnline) return false;
+                if (window.userPaused) return false;
+                if (typeof window.isAudioInterrupted === 'function' && window.isAudioInterrupted()) return false;
+                if (typeof window.isRealAudioPlaying === 'function') {
+                    return window.isRealAudioPlaying();
+                }
+                return !!(audio && !audio.paused && audio.readyState >= 2 && !audio.error);
+            }
+
             // ── Song-position helper ──────────────────────────────────────────────────────
             // Forwards elapsed/duration from the stream metadata to the Media Session API
             // so iPhone lock screen widgets and car head units can display the progress bar.
@@ -646,7 +659,8 @@
                 try {
                     const pos = Math.min(window._currentSongElapsed, duration);
                     const audio = RadioAudio.get();
-                    const rate = audio ? (audio.playbackRate || 1) : 1;
+                    const active = isRealStreamingActive();
+                    const rate = active ? (audio ? (audio.playbackRate || 1) : 1) : 0;
                     navigator.mediaSession.setPositionState({
                         duration: duration,
                         playbackRate: rate,
@@ -674,10 +688,20 @@
                 if (!Number.isFinite(duration) || duration <= 0) return null;
 
                 const lastElapsed = Math.max(0, Number(window._currentSongElapsed) || 0);
+                const audio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
+                const active = isRealStreamingActive();
+
+                if (!active) {
+                    return {
+                        duration: duration,
+                        playbackRate: 0,
+                        position: Math.min(lastElapsed, Math.max(0, duration - 0.25))
+                    };
+                }
+
                 const lastTimestamp = Number(window._songTimingTimestamp) || Date.now();
                 const elapsedSinceUpdate = Math.max(0, (Date.now() - lastTimestamp) / 1000);
                 const position = Math.min(lastElapsed + elapsedSinceUpdate, Math.max(0, duration - 0.25));
-                const audio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
 
                 return {
                     duration: duration,
@@ -685,6 +709,45 @@
                     position: position
                 };
             }
+
+            // Explicitly freezes lock screen / CarPlay progress bar so it stops ticking when paused or offline
+            window.freezeLiveMediaPosition = function (reason = 'freeze') {
+                if (!('mediaSession' in navigator)) return;
+                const duration = Number(window._currentSongDuration);
+                if (!Number.isFinite(duration) || duration <= 0) return;
+
+                const now = Date.now();
+                const lastTimestamp = Number(window._songTimingTimestamp) || now;
+                const elapsedSince = Math.max(0, (now - lastTimestamp) / 1000);
+                window._currentSongElapsed = Math.min(duration, (Number(window._currentSongElapsed) || 0) + elapsedSince);
+                window._songTimingTimestamp = now;
+
+                try {
+                    navigator.mediaSession.setPositionState({
+                        duration: duration,
+                        playbackRate: 0,
+                        position: window._currentSongElapsed
+                    });
+                } catch (e) { }
+
+                const durationEl = document.getElementById('song-duration-display');
+                if (durationEl) durationEl.textContent = formatDurationReadable(duration);
+                const remainingEl = document.getElementById('song-remaining-display');
+                if (remainingEl) {
+                    const remaining = Math.max(0, duration - window._currentSongElapsed);
+                    remainingEl.textContent = '-' + formatDurationReadable(remaining);
+                }
+            };
+
+            // Resumes ticking from where it was frozen without jumping forward
+            window.resumeLiveMediaPosition = function (reason = 'resume') {
+                if (!('mediaSession' in navigator)) return;
+                const duration = Number(window._currentSongDuration);
+                if (!Number.isFinite(duration) || duration <= 0) return;
+
+                window._songTimingTimestamp = Date.now();
+                window.reassertLiveMediaPosition(reason);
+            };
 
             window.reassertLiveMediaPosition = function (reason = 'live-media') {
                 if (!('mediaSession' in navigator)) return;
@@ -751,6 +814,11 @@
                         const duration = window._currentSongDuration;
                         if (!duration || duration <= 0) return;
 
+                        if (!isRealStreamingActive()) {
+                            // Audio is paused, buffering, or offline — do not increment progress
+                            return;
+                        }
+
                         // Interpolate elapsed from last SSE timestamp
                         const now = Date.now();
                         const elapsed = window._currentSongElapsed + ((now - window._songTimingTimestamp) / 1000);
@@ -775,6 +843,19 @@
                             remainingEl.textContent = '-' + formatDurationReadable(remaining);
                         }
                     });
+
+                    audio.addEventListener('playing', function () {
+                        window.resumeLiveMediaPosition('audio-playing');
+                    });
+                    audio.addEventListener('pause', function () {
+                        window.freezeLiveMediaPosition('audio-pause');
+                    });
+                    audio.addEventListener('waiting', function () {
+                        window.freezeLiveMediaPosition('audio-waiting');
+                    });
+                    audio.addEventListener('stalled', function () {
+                        window.freezeLiveMediaPosition('audio-stalled');
+                    });
                 }
                 // Bind immediately if possible, otherwise wait for DOM
                 if (document.readyState === 'loading') {
@@ -782,6 +863,15 @@
                 } else {
                     _bindTimeupdate();
                 }
+
+                window.addEventListener('offline', function () {
+                    window.freezeLiveMediaPosition('window-offline');
+                });
+                window.addEventListener('online', function () {
+                    if (typeof window.startMetadataUpdates === 'function') {
+                        window.startMetadataUpdates();
+                    }
+                });
             })();
 
             // Function to update the player with song information
@@ -1725,9 +1815,17 @@
                                 });
 
                                 // ── Forward song timing to Media Session ─────────────────
+                                const currentTrackKey = (artist || '') + '|||' + (title || '');
+                                const isSameTrack = (window._lastTrackKey === currentTrackKey);
+                                window._lastTrackKey = currentTrackKey;
+
                                 if (sseDuration > 0) {
                                     window._currentSongDuration = sseDuration;
-                                    window._currentSongElapsed = sseElapsed >= 0 ? sseElapsed : 0;
+                                    if (typeof sseElapsed === 'number' && sseElapsed >= 0) {
+                                        window._currentSongElapsed = sseElapsed;
+                                    } else if (!isSameTrack) {
+                                        window._currentSongElapsed = 0;
+                                    }
                                     window._songTimingTimestamp = Date.now();
                                     window.updatePositionState(window._currentSongElapsed, window._currentSongDuration);
                                 } else {

@@ -814,7 +814,7 @@
             var now = Date.now();
             var isUserAction = (reason.indexOf('user') !== -1 ||
                                 reason.indexOf('mediasession') !== -1 ||
-                                reason.indexOf('vehicle-reconnected') !== -1);
+                                reason.indexOf('reconnect') !== -1);
 
             // Throttle automatic recovery triggers so multiple events don't tear down the socket
             if (!isUserAction) {

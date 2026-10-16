@@ -506,17 +506,9 @@
             return base + sep + '_cb=' + Date.now();
         }
 
-        var _isSwitchingSource = false;
         // High-performance live stream mounter: assigns fresh timestamped URL without tearing down media authorization
         function mountFreshStream(audio, freshUrl) {
             if (!audio) return;
-            _isSwitchingSource = true;
-            try {
-                if (!audio.paused) {
-                    audio.pause();
-                }
-            } catch(e) {}
-
             try {
                 audio.muted = false;
             } catch(e) {}
@@ -526,12 +518,6 @@
             if (source) {
                 source.src = freshUrl;
             }
-            try {
-                audio.load();
-            } catch(e) {}
-            setTimeout(function() {
-                _isSwitchingSource = false;
-            }, 300);
         }
         function resetAndMountStream(audio, freshUrl) {
             mountFreshStream(audio, freshUrl);
@@ -827,7 +813,7 @@
             // Throttle automatic recovery triggers so multiple events don't tear down the socket
             if (!isUserAction) {
                 if (_isRecovering) return;
-                if (now - _lastRecoveryAttempt < 2500) return;
+                if (now - _lastRecoveryAttempt < 6000) return;
             }
 
             if (!window.isIntentStillValid() || window.userPaused) {
@@ -889,7 +875,7 @@
             clearTimeout(_recoverySafetyTimer);
             _recoverySafetyTimer = setTimeout(function() {
                 _isRecovering = false;
-            }, 5000);
+            }, 8000);
 
             var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
 
@@ -1157,6 +1143,13 @@
 
             liveAudio.addEventListener('playing', function() {
                 _isRecovering = false;
+                _reconnectAttempts = 0;
+                clearTimeout(_reconnectTimer);
+                _reconnectTimer = null;
+                clearTimeout(_recoverySafetyTimer);
+                clearTimeout(liveAudio._waitingTimeout);
+                if (typeof liveAudio._unhealthyCount !== 'undefined') liveAudio._unhealthyCount = 0;
+                window.hideReconnectingDialogue();
                 SilentCarrierAudio.stop();
                 window.setAudioInterrupted(false);
                 window.audioInterruptedByDevice = false;
@@ -1168,7 +1161,9 @@
                 audioPersistenceManager.saveAudioState();
                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
                 if ('mediaSession' in navigator) {
-                    navigator.mediaSession.playbackState = 'playing';
+                    try {
+                        navigator.mediaSession.playbackState = 'playing';
+                    } catch(e) {}
                 }
                 if (typeof window.reassertMediaSessionMetadata === 'function') {
                     window.reassertMediaSessionMetadata(true);
@@ -1180,7 +1175,9 @@
 
             liveAudio.addEventListener('play', function() {
                 if ('mediaSession' in navigator) {
-                    navigator.mediaSession.playbackState = 'playing';
+                    try {
+                        navigator.mediaSession.playbackState = 'playing';
+                    } catch(e) {}
                 }
                 if (typeof window.reassertMediaSessionMetadata === 'function') {
                     window.reassertMediaSessionMetadata(true);
@@ -1188,9 +1185,6 @@
             });
 
             liveAudio.addEventListener('pause', function() {
-                if (_isSwitchingSource) {
-                    return; // Ignore internal pause during source swap
-                }
                 audioPersistenceManager.saveAudioState();
                 releasePlayerWakeLock();
 
@@ -1227,6 +1221,7 @@
 
                 // 3. Network buffer starvation / cellular toggle in background:
                 // Keep SilentCarrierAudio running so iOS doesn't freeze the tab!
+                // Do NOT call recoverLiveStream here; allow browser to buffer naturally or await online event.
                 if (window.isIntentStillValid()) {
                     SilentCarrierAudio.start();
                     var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
@@ -1234,12 +1229,8 @@
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
                         window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
                     } else {
-                        var now = Date.now();
-                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
-                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                            window.showReconnectingDialogue("Buffering...", "Reconnecting to live stream...", "reconnecting");
-                            window.recoverLiveStream('stream-paused-network-starvation');
-                        }
+                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
+                        window.showReconnectingDialogue("Buffering...", "Buffering live stream...", "reconnecting");
                     }
                 } else {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -1254,12 +1245,8 @@
 
             liveAudio.addEventListener('stalled', function() {
                 if (window.isIntentStillValid() && !window.userPaused) {
-                    console.warn('⚠️ [SmartPlayer] Stream stalled event detected.');
-                    var now = Date.now();
-                    if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
-                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
-                        window.recoverLiveStream('stalled');
-                    }
+                    console.warn('⚠️ [SmartPlayer] Stream stalled event detected — waiting for stream buffer.');
+                    // Normal during mobile network buffering — DO NOT tear down stream socket!
                 }
             });
 
@@ -1272,7 +1259,7 @@
                         window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
                     } else {
                         var now = Date.now();
-                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 6000)) {
                             window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
                             window.recoverLiveStream('error');
                         }
@@ -1284,7 +1271,7 @@
                 console.warn('⚠️ [SmartPlayer] Stream ended unexpectedly.');
                 if (window.isIntentStillValid() && !window.userPaused) {
                     var now = Date.now();
-                    if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
+                    if (!_isRecovering && (now - _lastRecoveryAttempt >= 6000)) {
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
                         window.recoverLiveStream('ended');
                     }
@@ -1293,17 +1280,21 @@
 
             liveAudio.addEventListener('waiting', function() {
                 clearTimeout(liveAudio._waitingTimeout);
+                if (window.isIntentStillValid() && !window.userPaused) {
+                    window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
+                }
                 liveAudio._waitingTimeout = setTimeout(function() {
                     if (window.isIntentStillValid() && !window.userPaused && (!window.isRealAudioPlaying() || liveAudio.readyState < 3)) {
-                        console.warn('⚠️ [SmartPlayer] Audio waiting timeout (buffer exhausted).');
+                        console.warn('⚠️ [SmartPlayer] Audio waiting timeout (buffer exhausted for > 12s).');
                         var now = Date.now();
-                        if (!_isRecovering && (now - _lastRecoveryAttempt >= 2500)) {
-                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
+                        var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
+                        if (isOnline && !_isRecovering && (now - _lastRecoveryAttempt >= 6000)) {
+                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Recovering stream...");
                             window.showReconnectingDialogue("Buffering Stream", "Recovering audio connection...", "reconnecting");
                             window.recoverLiveStream('waiting-timeout');
                         }
                     }
-                }, 3000);
+                }, 12000);
             });
         }
         initAudio();
@@ -1315,10 +1306,11 @@
                 window.startMetadataUpdates();
             }
             if (window.isIntentStillValid() && !window.userPaused) {
-                console.log('🌐 [SmartPlayer] Network online event fired — waiting for cellular routing to stabilize.');
+                console.log('🌐 [SmartPlayer] Network online event fired — stabilizing cellular connection.');
                 window.showReconnectingDialogue("Internet Restored", "Reconnecting to live stream...", "reconnecting");
                 _resumeOnGestureArmed = false;
                 clearTimeout(_reconnectTimer);
+                _reconnectTimer = null;
                 clearTimeout(_recoverySafetyTimer);
                 SilentCarrierAudio.start();
 
@@ -1332,7 +1324,7 @@
                         _lastRecoveryAttempt = 0; // Authorized recovery after stabilization
                         window.recoverLiveStream('network-online-restored');
                     }
-                }, 900);
+                }, 1200);
             }
         });
 
@@ -1478,7 +1470,6 @@
             }
 
             if (window.isIntentStillValid()) {
-                // Keep silent keep-alive running while intent is active and not user paused
                 if (!window.userPaused && !window.audioInterruptedByDevice) {
                     SilentCarrierAudio.start();
                 }
@@ -1495,42 +1486,32 @@
                 }
 
                 var audio = RadioAudio.get();
-                if (audio) {
-                    var isRealPlaying = window.isRealAudioPlaying();
-                    if (!isRealPlaying || audio.paused || audio.readyState < 2 || audio.error) {
-                        var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
-                        if (isOnline) {
-                            window.recoverLiveStream('watchdog-' + source);
-                        } else {
-                            window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
-                            window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
+                if (!audio) return;
 
-                            // Background ping to detect cellular restore even when iOS suppresses online event
-                            pingNetworkStatus(function(nowOnline) {
-                                if (nowOnline && window.isIntentStillValid() && !window.userPaused) {
-                                    console.log('🌐 [SmartPlayer] Background ping detected network restored!');
-                                    _resumeOnGestureArmed = false;
-                                    _isRecovering = false;
-                                    _reconnectAttempts = 0;
-                                    clearTimeout(_reconnectTimer);
-                                    clearTimeout(_recoverySafetyTimer);
-                                    window.recoverLiveStream('bg-ping-restored');
-                                }
-                            });
-                        }
-                    } else if (typeof audio.currentTime === 'number') {
-                        if (typeof audio._lastWatchdogTime !== 'undefined' && audio.currentTime === audio._lastWatchdogTime) {
-                            audio._watchdogFrozenCount = (audio._watchdogFrozenCount || 0) + 1;
-                            if (audio._watchdogFrozenCount >= 2) {
-                                console.warn('⚠️ Periodic watchdog: Live audio time frozen while playing — auto-recovering fresh stream...');
-                                window.recoverLiveStream('watchdog-frozen-stream');
-                                audio._watchdogFrozenCount = 0;
-                            }
-                        } else {
-                            audio._lastWatchdogTime = audio.currentTime;
-                            audio._watchdogFrozenCount = 0;
-                        }
-                    }
+                var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
+                if (!isOnline) {
+                    window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
+                    window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
+                    return;
+                }
+
+                // If audio is currently recovering or a recovery attempt was made recently, DO NOT interrupt!
+                if (_isRecovering || (Date.now() - _lastRecoveryAttempt < 10000)) {
+                    return;
+                }
+
+                // If audio is genuinely playing, reset counter and return
+                if (!audio.paused && audio.readyState >= 2 && !audio.error) {
+                    audio._watchdogDeadTicks = 0;
+                    return;
+                }
+
+                // Only if stream is persistently dead for at least 2 consecutive watchdog runs (20 seconds)
+                audio._watchdogDeadTicks = (audio._watchdogDeadTicks || 0) + 1;
+                if (audio._watchdogDeadTicks >= 2) {
+                    console.warn('⚠️ [Watchdog] Audio persistently inactive for > 20s while online — recovering (' + source + ')');
+                    audio._watchdogDeadTicks = 0;
+                    window.recoverLiveStream('watchdog-' + source);
                 }
             } else {
                 if (window._currentPlayerState === window.PLAYER_STATE.PLAYING && !window.isRealAudioPlaying()) {
@@ -1539,25 +1520,10 @@
             }
         }
 
-        // Periodic background interval (runs every 2.5s)
+        // Periodic background interval (runs every 10s as a quiet safety net)
         setInterval(function() {
             runPeriodicWatchdog('interval');
-        }, 2500);
-
-        // Web Worker heartbeat: keeps background tabs actively checking every 2.5s without throttling
-        // This ensures reconnection occurs even while user is in Google Maps for 30 minutes
-        try {
-            if (typeof window.Worker !== 'undefined' && typeof window.Blob !== 'undefined') {
-                var workerBlob = new Blob([
-                    'var timer = setInterval(function() { postMessage("tick"); }, 2500);'
-                ], { type: 'application/javascript' });
-                var workerUrl = URL.createObjectURL(workerBlob);
-                var bgWorker = new Worker(workerUrl);
-                bgWorker.onmessage = function() {
-                    runPeriodicWatchdog('worker-heartbeat');
-                };
-            }
-        } catch (e) {}
+        }, 10000);
 
         // Global delegated click handler for all play/pause buttons
         document.addEventListener('click', function(e) {

@@ -727,7 +727,11 @@
                         var p = RadioAudio.play();
                         if (p && typeof p.then === 'function') {
                             p.then(function() {
+                                SilentCarrierAudio.stop();
                                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
+                                if ('mediaSession' in navigator) {
+                                    navigator.mediaSession.playbackState = 'playing';
+                                }
                                 if (typeof window.reassertMediaSessionMetadata === 'function') {
                                     window.reassertMediaSessionMetadata(true);
                                 }
@@ -783,13 +787,19 @@
                     playPromise.then(function() {
                         _resumeOnGestureArmed = false;
                         _reconnectAttempts = 0;
-                        SilentCarrierAudio.start();
+                        SilentCarrierAudio.stop();
                         window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                         audioPersistenceManager.saveAudioState();
                         window.setPlayerState(window.PLAYER_STATE.PLAYING);
                         window.showReconnectingDialogue("Connected!", "Live stream resumed.", "success");
+                        if ('mediaSession' in navigator) {
+                            navigator.mediaSession.playbackState = 'playing';
+                        }
                         if (typeof window.reassertMediaSessionMetadata === 'function') {
-                            window.reassertMediaSessionMetadata();
+                            window.reassertMediaSessionMetadata(true);
+                        }
+                        if (typeof window.resumeLiveMediaPosition === 'function') {
+                            window.resumeLiveMediaPosition('toggleLiveAudio-success');
                         }
                         requestPlayerWakeLock();
                     }).catch(function(error) {
@@ -1182,11 +1192,32 @@
             liveAudio.addEventListener('playing', function() {
                 _isRecovering = false;
                 SilentCarrierAudio.stop();
+                window.setAudioInterrupted(false);
+                window.audioInterruptedByDevice = false;
+                try {
+                    window.safeLocalStorage.removeItem(window.getStationStorageKey('interrupted_by_device'));
+                    window.safeLocalStorage.removeItem(window.getStationStorageKey('interrupted_time'));
+                } catch(e) {}
                 window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                 audioPersistenceManager.saveAudioState();
                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'playing';
+                }
                 if (typeof window.reassertMediaSessionMetadata === 'function') {
-                    window.reassertMediaSessionMetadata();
+                    window.reassertMediaSessionMetadata(true);
+                }
+                if (typeof window.resumeLiveMediaPosition === 'function') {
+                    window.resumeLiveMediaPosition('audio-playing');
+                }
+            });
+
+            liveAudio.addEventListener('play', function() {
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'playing';
+                }
+                if (typeof window.reassertMediaSessionMetadata === 'function') {
+                    window.reassertMediaSessionMetadata(true);
                 }
             });
 

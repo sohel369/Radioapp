@@ -201,16 +201,32 @@
                 }
             }
 
-            if (meta) {
+            // Reliable fallback to cached storage or app defaults if still unset
+            if (!meta) {
+                let savedTitle = '';
+                let savedArtist = '';
                 try {
-                    navigator.mediaSession.metadata = new MediaMetadata(meta);
-                } catch (e) {
-                    if (navigator.mediaSession.metadata) {
-                        navigator.mediaSession.metadata.title = meta.title;
-                        navigator.mediaSession.metadata.artist = meta.artist;
-                        navigator.mediaSession.metadata.album = meta.album;
-                        navigator.mediaSession.metadata.artwork = meta.artwork;
-                    }
+                    savedTitle = window.safeLocalStorage.getItem(window.getStationStorageKey('current_title')) || '';
+                    savedArtist = window.safeLocalStorage.getItem(window.getStationStorageKey('current_artist')) || '';
+                } catch (e) {}
+
+                meta = {
+                    title: (savedTitle && savedTitle !== 'Loading metadata...' && savedTitle !== 'Loading...') ? savedTitle : (_appName || 'Live Radio'),
+                    artist: (savedArtist && savedArtist !== 'Loading...' && savedArtist !== 'Now Playing') ? savedArtist : (stationSlogan || 'Live Stream'),
+                    album: getAlbumTitle(),
+                    artwork: window._defaultArtwork || buildDefaultArtwork()
+                };
+                window._storedMediaMetadata = meta;
+            }
+
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata(meta);
+            } catch (e) {
+                if (navigator.mediaSession.metadata) {
+                    navigator.mediaSession.metadata.title = meta.title;
+                    navigator.mediaSession.metadata.artist = meta.artist;
+                    navigator.mediaSession.metadata.album = meta.album;
+                    navigator.mediaSession.metadata.artwork = meta.artwork;
                 }
             }
             _syncMediaSessionPlaybackState();
@@ -547,6 +563,20 @@
                     console.warn('Could not update document title:', e);
                 }
 
+                // Immediately initialize MediaMetadata so lock screen has metadata from the start
+                if ('mediaSession' in navigator) {
+                    try {
+                        const metaObj = {
+                            title: cleanTitle,
+                            artist: cleanArtist,
+                            album: getAlbumTitle(),
+                            artwork: window._defaultArtwork || buildDefaultArtwork()
+                        };
+                        window._storedMediaMetadata = metaObj;
+                        navigator.mediaSession.metadata = new MediaMetadata(metaObj);
+                    } catch (e) {}
+                }
+
                 return {
                     artist: cleanArtist,
                     title: cleanTitle
@@ -637,6 +667,13 @@
                 const isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
                 if (!isOnline) return false;
                 if (window.userPaused) return false;
+                // If audio element is genuinely playing, it is definitely active
+                if (audio && !audio.paused && audio.readyState >= 2 && !audio.error) {
+                    if (typeof window.isAudioInterrupted === 'function' && window.isAudioInterrupted()) {
+                        if (typeof window.setAudioInterrupted === 'function') window.setAudioInterrupted(false);
+                    }
+                    return true;
+                }
                 if (typeof window.isAudioInterrupted === 'function' && window.isAudioInterrupted()) return false;
                 if (typeof window.isRealAudioPlaying === 'function') {
                     return window.isRealAudioPlaying();
@@ -648,17 +685,19 @@
             // Forwards elapsed/duration from the stream metadata to the Media Session API
             // so iPhone lock screen widgets and car head units can display the progress bar.
             window.updatePositionState = function (elapsed, duration) {
-                if (!('mediaSession' in navigator)) return;
-                if (typeof duration !== 'number' || duration <= 0) return;
+                if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setPositionState !== 'function') return;
+                if (typeof duration !== 'number' || duration <= 0 || !Number.isFinite(duration)) return;
 
                 // Store for timeupdate interpolation
                 window._currentSongDuration = duration;
-                window._currentSongElapsed = (typeof elapsed === 'number' && elapsed >= 0) ? elapsed : 0;
+                window._currentSongElapsed = (typeof elapsed === 'number' && elapsed >= 0 && Number.isFinite(elapsed)) ? elapsed : 0;
                 window._songTimingTimestamp = Date.now();
 
                 try {
-                    const pos = Math.min(window._currentSongElapsed, duration);
-                    const audio = RadioAudio.get();
+                    // W3C spec requires: 0 <= position < duration (strictly less than duration)
+                    const maxSafePos = Math.max(0, duration - 0.5);
+                    const pos = Math.min(Math.max(0, window._currentSongElapsed), maxSafePos);
+                    const audio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
                     const active = isRealStreamingActive();
                     const rate = active ? (audio ? (audio.playbackRate || 1) : 1) : 0;
                     navigator.mediaSession.setPositionState({
@@ -690,18 +729,19 @@
                 const lastElapsed = Math.max(0, Number(window._currentSongElapsed) || 0);
                 const audio = (typeof RadioAudio !== 'undefined') ? RadioAudio.get() : null;
                 const active = isRealStreamingActive();
+                const maxSafePos = Math.max(0, duration - 0.5);
 
                 if (!active) {
                     return {
                         duration: duration,
                         playbackRate: 0,
-                        position: Math.min(lastElapsed, Math.max(0, duration - 0.25))
+                        position: Math.min(lastElapsed, maxSafePos)
                     };
                 }
 
                 const lastTimestamp = Number(window._songTimingTimestamp) || Date.now();
                 const elapsedSinceUpdate = Math.max(0, (Date.now() - lastTimestamp) / 1000);
-                const position = Math.min(lastElapsed + elapsedSinceUpdate, Math.max(0, duration - 0.25));
+                const position = Math.min(Math.max(0, lastElapsed + elapsedSinceUpdate), maxSafePos);
 
                 return {
                     duration: duration,
@@ -712,14 +752,15 @@
 
             // Explicitly freezes lock screen / CarPlay progress bar so it stops ticking when paused or offline
             window.freezeLiveMediaPosition = function (reason = 'freeze') {
-                if (!('mediaSession' in navigator)) return;
+                if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setPositionState !== 'function') return;
                 const duration = Number(window._currentSongDuration);
                 if (!Number.isFinite(duration) || duration <= 0) return;
 
+                const maxSafePos = Math.max(0, duration - 0.5);
                 const now = Date.now();
                 const lastTimestamp = Number(window._songTimingTimestamp) || now;
                 const elapsedSince = Math.max(0, (now - lastTimestamp) / 1000);
-                window._currentSongElapsed = Math.min(duration, (Number(window._currentSongElapsed) || 0) + elapsedSince);
+                window._currentSongElapsed = Math.min(maxSafePos, (Number(window._currentSongElapsed) || 0) + elapsedSince);
                 window._songTimingTimestamp = now;
 
                 try {
@@ -810,9 +851,9 @@
                     audio._timeupdateSyncBound = true;
 
                     audio.addEventListener('timeupdate', function () {
-                        if (!('mediaSession' in navigator)) return;
+                        if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setPositionState !== 'function') return;
                         const duration = window._currentSongDuration;
-                        if (!duration || duration <= 0) return;
+                        if (!duration || duration <= 0 || !Number.isFinite(duration)) return;
 
                         if (!isRealStreamingActive()) {
                             // Audio is paused, buffering, or offline — do not increment progress
@@ -821,8 +862,9 @@
 
                         // Interpolate elapsed from last SSE timestamp
                         const now = Date.now();
-                        const elapsed = window._currentSongElapsed + ((now - window._songTimingTimestamp) / 1000);
-                        const currentTime = Math.min(Math.max(0, elapsed), duration);
+                        const elapsed = (Number(window._currentSongElapsed) || 0) + ((now - (Number(window._songTimingTimestamp) || now)) / 1000);
+                        const maxSafePos = Math.max(0, duration - 0.5);
+                        const currentTime = Math.min(Math.max(0, elapsed), maxSafePos);
                         const playbackRate = audio.playbackRate || 1;
 
                         try {
@@ -845,16 +887,13 @@
                     });
 
                     audio.addEventListener('playing', function () {
+                        if ('mediaSession' in navigator) {
+                            navigator.mediaSession.playbackState = 'playing';
+                        }
                         window.resumeLiveMediaPosition('audio-playing');
                     });
                     audio.addEventListener('pause', function () {
                         window.freezeLiveMediaPosition('audio-pause');
-                    });
-                    audio.addEventListener('waiting', function () {
-                        window.freezeLiveMediaPosition('audio-waiting');
-                    });
-                    audio.addEventListener('stalled', function () {
-                        window.freezeLiveMediaPosition('audio-stalled');
                     });
                 }
                 // Bind immediately if possible, otherwise wait for DOM
@@ -2558,6 +2597,15 @@
                         try {
                             window.safeLocalStorage.setItem(window.getStationStorageKey('was_playing'), '1');
                         } catch(e) {}
+                        if ('mediaSession' in navigator) {
+                            navigator.mediaSession.playbackState = 'playing';
+                            if (typeof window.reassertMediaSessionMetadata === 'function') {
+                                window.reassertMediaSessionMetadata(true);
+                            }
+                            if (typeof window.reassertLiveMediaPosition === 'function') {
+                                window.reassertLiveMediaPosition('screen-lock');
+                            }
+                        }
                     }
                 }
             });

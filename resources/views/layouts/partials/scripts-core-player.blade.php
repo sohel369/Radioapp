@@ -101,6 +101,9 @@
                 },
                 play: function() {
                     var a = this.get();
+                    if (typeof SilentCarrierAudio !== 'undefined') {
+                        SilentCarrierAudio.start();
+                    }
                     if (!a || typeof a.play !== 'function') {
                         return (typeof window.Promise !== 'undefined' ? Promise.resolve() : undefined);
                     }
@@ -120,6 +123,9 @@
                         try {
                             a.pause();
                         } catch (e) {}
+                    }
+                    if (window.userPaused && typeof SilentCarrierAudio !== 'undefined') {
+                        SilentCarrierAudio.stop();
                     }
                 },
                 setSrc: function(src) {
@@ -144,6 +150,95 @@
                 }
             };
         })();
+
+        // iOS Safari background keep-alive silent carrier:
+        // Maintains AVAudioSession active so iOS does not suspend JavaScript execution
+        // when cellular drops while driving / navigating in Google Maps.
+        var SilentCarrierAudio = (function() {
+            var _carrierEl = null;
+            var _blobUrl = null;
+
+            function getCarrierBlobUrl() {
+                if (_blobUrl) return _blobUrl;
+                try {
+                    var sampleRate = 8000;
+                    var numSamples = 4000;
+                    var dataSize = numSamples * 2;
+                    var buffer = new ArrayBuffer(44 + dataSize);
+                    var view = new DataView(buffer);
+                    function writeString(offset, string) {
+                        for (var i = 0; i < string.length; i++) {
+                            view.setUint8(offset + i, string.charCodeAt(i));
+                        }
+                    }
+                    writeString(0, 'RIFF');
+                    view.setUint32(4, 36 + dataSize, true);
+                    writeString(8, 'WAVE');
+                    writeString(12, 'fmt ');
+                    view.setUint32(16, 16, true);
+                    view.setUint16(20, 1, true); // PCM
+                    view.setUint16(22, 1, true); // Mono
+                    view.setUint32(24, sampleRate, true);
+                    view.setUint32(28, sampleRate * 2, true);
+                    view.setUint16(32, 2, true);
+                    view.setUint16(34, 16, true);
+                    writeString(36, 'data');
+                    view.setUint32(40, dataSize, true);
+                    var blob = new Blob([buffer], { type: 'audio/wav' });
+                    _blobUrl = URL.createObjectURL(blob);
+                } catch(e) {
+                    _blobUrl = 'data:audio/wav;base64,UklGRmQfAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAfAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+                }
+                return _blobUrl;
+            }
+
+            function getElement() {
+                if (!_carrierEl) {
+                    _carrierEl = document.getElementById('silent-carrier-audio');
+                    if (!_carrierEl) {
+                        _carrierEl = document.createElement('audio');
+                        _carrierEl.id = 'silent-carrier-audio';
+                        _carrierEl.setAttribute('playsinline', 'true');
+                        _carrierEl.setAttribute('webkit-playsinline', 'true');
+                        _carrierEl.setAttribute('preload', 'auto');
+                        _carrierEl.loop = true;
+                        _carrierEl.volume = 0.001;
+                        _carrierEl.src = getCarrierBlobUrl();
+                        _carrierEl.style.display = 'none';
+                        (document.body || document.documentElement).appendChild(_carrierEl);
+                    }
+                }
+                return _carrierEl;
+            }
+
+            return {
+                start: function() {
+                    try {
+                        var el = getElement();
+                        if (el && el.paused) {
+                            el.volume = 0.001;
+                            var p = el.play();
+                            if (p && typeof p.catch === 'function') {
+                                p.catch(function(e) {});
+                            }
+                        }
+                    } catch(e) {}
+                },
+                stop: function() {
+                    try {
+                        var el = getElement();
+                        if (el && !el.paused) {
+                            el.pause();
+                        }
+                    } catch(e) {}
+                },
+                isPlaying: function() {
+                    var el = getElement();
+                    return !!(el && !el.paused);
+                }
+            };
+        })();
+        window.SilentCarrierAudio = SilentCarrierAudio;
     </script>
     <script>
         // Private / Incognito browsing safe storage polyfill (in-memory fallback)
@@ -658,6 +753,7 @@
                 window.userPaused = false;
                 window.setAudioInterrupted(false);
                 savePlayingIntent(true);
+                SilentCarrierAudio.start();
                 _reconnectAttempts = 0;
                 try { window.safeLocalStorage.removeItem(window.getStationStorageKey('tab_closed_at')); } catch(e) {}
 
@@ -672,6 +768,7 @@
                     playPromise.then(function() {
                         _resumeOnGestureArmed = false;
                         _reconnectAttempts = 0;
+                        SilentCarrierAudio.start();
                         window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                         audioPersistenceManager.saveAudioState();
                         window.setPlayerState(window.PLAYER_STATE.PLAYING);
@@ -728,6 +825,7 @@
                 window.userPaused = true;
                 window.setAudioInterrupted(false);
                 savePlayingIntent(false);
+                SilentCarrierAudio.stop();
                 RadioAudio.pause();
                 audioPersistenceManager.saveAudioState();
                 window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -758,17 +856,39 @@
             if (!window.isIntentStillValid() || window.userPaused) {
                 window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                 window.hideReconnectingDialogue();
+                SilentCarrierAudio.stop();
                 _isRecovering = false;
                 return;
             }
 
+            // Ensure background keepalive audio carrier is active
+            SilentCarrierAudio.start();
+
             // If audio was paused due to CarPlay / Bluetooth disconnect, do NOT force playback on phone speaker!
             // Wait for CarPlay / Bluetooth reconnect or explicit user / mediasession / call-ended action
             if (window.isAudioInterrupted()) {
+                var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
                 var isAuthorized = (reason.indexOf('reconnect') !== -1 ||
                                     reason.indexOf('mediasession') !== -1 ||
                                     reason.indexOf('user') !== -1 ||
-                                    reason.indexOf('call-ended') !== -1);
+                                    reason.indexOf('call-ended') !== -1 ||
+                                    reason.indexOf('network') !== -1 ||
+                                    reason.indexOf('online') !== -1 ||
+                                    reason.indexOf('stalled') !== -1 ||
+                                    reason.indexOf('waiting') !== -1 ||
+                                    reason.indexOf('error') !== -1 ||
+                                    reason.indexOf('watchdog') !== -1 ||
+                                    reason.indexOf('starvation') !== -1 ||
+                                    reason.indexOf('ping') !== -1);
+
+                // If confirmed Bluetooth physical disconnect, only allow recovery if vehicle reconnected or user/mediasession action
+                if (intType === 'bluetooth' && (reason.indexOf('vehicle-reconnected') === -1 && reason.indexOf('user') === -1 && reason.indexOf('mediasession') === -1)) {
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                    window.hideReconnectingDialogue();
+                    _isRecovering = false;
+                    return;
+                }
+
                 if (!isAuthorized) {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
@@ -818,6 +938,7 @@
                     clearTimeout(_reconnectTimer);
                     clearTimeout(_recoverySafetyTimer);
                     _resumeOnGestureArmed = false;
+                    SilentCarrierAudio.start();
                     window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                     audioPersistenceManager.saveAudioState();
                     window.setPlayerState(window.PLAYER_STATE.PLAYING);
@@ -837,7 +958,7 @@
                         return;
                     }
 
-                    if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted()) {
+                    if (window.isIntentStillValid() && !window.userPaused) {
                         clearTimeout(_reconnectTimer);
                         var delay = getReconnectBackoff(_reconnectAttempts);
 
@@ -851,7 +972,7 @@
                                 window.showReconnectingDialogue("Stream Connection Lost", "Reconnecting in " + Math.round(delay / 1000) + "s (Attempt " + _reconnectAttempts + ")...", "reconnecting");
                             }
                             _reconnectTimer = setTimeout(function() {
-                                if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted()) {
+                                if (window.isIntentStillValid() && !window.userPaused) {
                                     window.recoverLiveStream('scheduled-retry-' + _reconnectAttempts);
                                 }
                             }, delay);
@@ -869,6 +990,7 @@
                 _reconnectAttempts = 0;
                 clearTimeout(_reconnectTimer);
                 clearTimeout(_recoverySafetyTimer);
+                SilentCarrierAudio.start();
                 window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
                 window.showReconnectingDialogue("Connected!", "Live stream resumed.", "success");
@@ -1023,6 +1145,7 @@
                         window.userPaused = false;
                         window.setAudioInterrupted(false);
                         savePlayingIntent(true);
+                        SilentCarrierAudio.start();
                         window.recoverLiveStream('mediasession-play');
                     });
                 } catch (e) {}
@@ -1034,11 +1157,13 @@
 
                         if (isDisconnectWindow) {
                             window.userPaused = false;
-                            window.setAudioInterrupted(true);
+                            window.setAudioInterrupted(true, 'bluetooth');
+                            SilentCarrierAudio.stop();
                         } else {
                             window.userPaused = true;
                             window.setAudioInterrupted(false);
                             savePlayingIntent(false);
+                            SilentCarrierAudio.stop();
                         }
                         RadioAudio.pause();
                         window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
@@ -1051,6 +1176,7 @@
                         window.userPaused = true;
                         window.setAudioInterrupted(false);
                         savePlayingIntent(false);
+                        SilentCarrierAudio.stop();
                         RadioAudio.pause();
                         window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                         releasePlayerWakeLock();
@@ -1087,23 +1213,43 @@
                     window.setAudioInterrupted(false);
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
+                    SilentCarrierAudio.stop();
                     return;
                 }
 
-                // 2. Involuntary pause while intent is active (e.g. vehicle disconnect, phone call):
-                if (window.isIntentStillValid()) {
-                    var isKnownBt = window.audioInterruptedByDevice;
-                    window.setAudioInterrupted(true, isKnownBt ? 'bluetooth' : 'call');
+                // 2. Involuntary pause: check if this is an actual Bluetooth / CarPlay device disconnect
+                var timeSinceDisconnect = Date.now() - window.getLastAudioDisconnectTime();
+                var isDeviceDisconnect = window.audioInterruptedByDevice || (timeSinceDisconnect < 3000);
+
+                if (isDeviceDisconnect) {
+                    window.setAudioInterrupted(true, 'bluetooth');
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
+                    SilentCarrierAudio.stop();
                     if ('mediaSession' in navigator) {
                         try {
                             navigator.mediaSession.playbackState = 'paused';
                         } catch(e) {}
                     }
+                    return;
+                }
+
+                // 3. Network buffer starvation / cellular toggle in background:
+                // Keep SilentCarrierAudio running so iOS doesn't freeze the tab!
+                if (window.isIntentStillValid()) {
+                    var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
+                    if (!isOnline) {
+                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
+                        window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
+                    } else {
+                        window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
+                        window.showReconnectingDialogue("Buffering...", "Reconnecting to live stream...", "reconnecting");
+                    }
+                    window.recoverLiveStream('stream-paused-network-starvation');
                 } else {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
+                    SilentCarrierAudio.stop();
                 }
             });
 
@@ -1112,7 +1258,7 @@
             });
 
             liveAudio.addEventListener('stalled', function() {
-                if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted()) {
+                if (window.isIntentStillValid() && !window.userPaused) {
                     console.warn('⚠️ [SmartPlayer] Stream stalled event detected.');
                     window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
                     window.recoverLiveStream('stalled');
@@ -1121,7 +1267,7 @@
 
             liveAudio.addEventListener('error', function() {
                 console.error('⚠️ [SmartPlayer] Live audio error:', liveAudio.error);
-                if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted()) {
+                if (window.isIntentStillValid() && !window.userPaused) {
                     var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
                     if (!isOnline) {
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
@@ -1135,7 +1281,7 @@
 
             liveAudio.addEventListener('ended', function() {
                 console.warn('⚠️ [SmartPlayer] Stream ended unexpectedly.');
-                if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted()) {
+                if (window.isIntentStillValid() && !window.userPaused) {
                     window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Reconnecting stream...");
                     window.recoverLiveStream('ended');
                 }
@@ -1144,7 +1290,7 @@
             liveAudio.addEventListener('waiting', function() {
                 clearTimeout(liveAudio._waitingTimeout);
                 liveAudio._waitingTimeout = setTimeout(function() {
-                    if (window.isIntentStillValid() && !window.userPaused && !window.isAudioInterrupted() && (!window.isRealAudioPlaying() || liveAudio.readyState < 3)) {
+                    if (window.isIntentStillValid() && !window.userPaused && (!window.isRealAudioPlaying() || liveAudio.readyState < 3)) {
                         console.warn('⚠️ [SmartPlayer] Audio waiting timeout (buffer exhausted).');
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Buffering...");
                         window.showReconnectingDialogue("Buffering Stream", "Recovering audio connection...", "reconnecting");
@@ -1210,13 +1356,14 @@
                 var isAudioActuallyPlaying = window.isRealAudioPlaying ? window.isRealAudioPlaying() : (!RadioAudio.paused());
 
                 // 1. DISCONNECT DETECTION:
-                // Audio device disconnected (currentCount < prevCount, or route shifted while playing)
-                var isDisconnect = (currentCount < prevCount) || (isAudioActuallyPlaying && source === 'devicechange' && currentCount <= prevCount);
+                // Audio device disconnected (currentCount < prevCount)
+                var isDisconnect = (currentCount < prevCount);
 
                 if (isDisconnect) {
                     clearTimeout(_resumeDebounceTimer);
                     window.userPaused = false; // preserve intent to resume when reconnected
                     window.setAudioInterrupted(true, 'bluetooth');
+                    SilentCarrierAudio.stop();
                     RadioAudio.pause();
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     if ('mediaSession' in navigator) {
@@ -1239,6 +1386,7 @@
                             window.setAudioInterrupted(false);
                             window.userPaused = false;
                             savePlayingIntent(true);
+                            SilentCarrierAudio.start();
                             window.recoverLiveStream('vehicle-reconnected-' + source);
                         }
                     }, 800);
@@ -1257,29 +1405,84 @@
             }
         }
 
+        var _lastPingTime = 0;
+        var _isPinging = false;
+        function pingNetworkStatus(callback) {
+            var now = Date.now();
+            if (_isPinging || (now - _lastPingTime < 2500)) return;
+            _lastPingTime = now;
+            _isPinging = true;
+
+            var img = new Image();
+            var timer = setTimeout(function() {
+                _isPinging = false;
+                img.src = '';
+                if (callback) callback(false);
+            }, 2500);
+
+            img.onload = function() {
+                clearTimeout(timer);
+                _isPinging = false;
+                if (callback) callback(true);
+            };
+            img.onerror = function() {
+                clearTimeout(timer);
+                _isPinging = false;
+                if (typeof fetch === 'function') {
+                    fetch('/api/stream-metadata?ping=' + Date.now(), { method: 'HEAD', cache: 'no-store' })
+                        .then(function(res) {
+                            if (callback) callback(res.ok || res.status < 500);
+                        })
+                        .catch(function() {
+                            if (callback) callback(false);
+                        });
+                } else {
+                    if (callback) callback(false);
+                }
+            };
+            img.src = '/favicon.ico?_ping=' + now;
+        }
+
         function runPeriodicWatchdog(source) {
             if (_resumeOnGestureArmed) {
                 return;
             }
 
             if (window.isIntentStillValid()) {
-                // If paused due to CarPlay / Bluetooth disconnect, stay paused and do NOT play on phone speaker!
+                // Keep silent keep-alive running while intent is active and not user paused
+                if (!window.userPaused && !window.audioInterruptedByDevice) {
+                    SilentCarrierAudio.start();
+                }
+
+                // If paused due to verified Bluetooth / CarPlay physical disconnect, stay paused
                 if (window.isAudioInterrupted()) {
-                    if (window._currentPlayerState !== window.PLAYER_STATE.PAUSED) {
-                        window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                    var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+                    if (intType === 'bluetooth') {
+                        if (window._currentPlayerState !== window.PLAYER_STATE.PAUSED) {
+                            window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                        }
+                        return;
                     }
-                    return;
                 }
 
                 var audio = RadioAudio.get();
                 if (audio) {
-                    if (audio.paused || audio.readyState < 2 || audio.error) {
+                    var isRealPlaying = window.isRealAudioPlaying();
+                    if (!isRealPlaying || audio.paused || audio.readyState < 2 || audio.error) {
                         var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
                         if (isOnline) {
                             window.recoverLiveStream('watchdog-' + source);
                         } else {
                             window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");
                             window.showReconnectingDialogue("Network Offline", "Waiting for internet connection...", "offline");
+
+                            // Background ping to detect cellular restore even when iOS suppresses online event
+                            pingNetworkStatus(function(nowOnline) {
+                                if (nowOnline && window.isIntentStillValid() && !window.userPaused) {
+                                    console.log('🌐 [SmartPlayer] Background ping detected network restored!');
+                                    window.recoverLiveStream('bg-ping-restored');
+                                }
+                            });
                         }
                     } else if (typeof audio.currentTime === 'number') {
                         if (typeof audio._lastWatchdogTime !== 'undefined' && audio.currentTime === audio._lastWatchdogTime) {
@@ -1302,17 +1505,17 @@
             }
         }
 
-        // Periodic background interval (runs every 3s)
+        // Periodic background interval (runs every 2.5s)
         setInterval(function() {
             runPeriodicWatchdog('interval');
-        }, 3000);
+        }, 2500);
 
-        // Web Worker heartbeat: keeps background tabs actively checking every 3s without throttling
+        // Web Worker heartbeat: keeps background tabs actively checking every 2.5s without throttling
         // This ensures reconnection occurs even while user is in Google Maps for 30 minutes
         try {
             if (typeof window.Worker !== 'undefined' && typeof window.Blob !== 'undefined') {
                 var workerBlob = new Blob([
-                    'var timer = setInterval(function() { postMessage("tick"); }, 3000);'
+                    'var timer = setInterval(function() { postMessage("tick"); }, 2500);'
                 ], { type: 'application/javascript' });
                 var workerUrl = URL.createObjectURL(workerBlob);
                 var bgWorker = new Worker(workerUrl);

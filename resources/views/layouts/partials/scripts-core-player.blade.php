@@ -1152,22 +1152,23 @@
 
                 try {
                     navigator.mediaSession.setActionHandler('pause', function() {
-                        var timeSinceDisconnect = Date.now() - window.getLastAudioDisconnectTime();
-                        var isDisconnectWindow = (timeSinceDisconnect < 2500) || window.isAudioInterrupted();
-
-                        if (isDisconnectWindow) {
-                            window.userPaused = false;
-                            window.setAudioInterrupted(true, 'bluetooth');
-                            SilentCarrierAudio.stop();
-                        } else {
-                            window.userPaused = true;
-                            window.setAudioInterrupted(false);
-                            savePlayingIntent(false);
-                            SilentCarrierAudio.stop();
-                        }
+                        window.userPaused = true;
+                        window.setAudioInterrupted(false);
+                        savePlayingIntent(false);
+                        if (typeof _reconnectTimer !== 'undefined') clearTimeout(_reconnectTimer);
+                        if (typeof _recoverySafetyTimer !== 'undefined') clearTimeout(_recoverySafetyTimer);
+                        _isRecovering = false;
+                        SilentCarrierAudio.stop();
                         RadioAudio.pause();
+                        audioPersistenceManager.saveAudioState();
                         window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                        window.hideReconnectingDialogue();
                         releasePlayerWakeLock();
+                        if ('mediaSession' in navigator) {
+                            try {
+                                navigator.mediaSession.playbackState = 'paused';
+                            } catch(e) {}
+                        }
                     });
                 } catch (e) {}
 
@@ -1176,10 +1177,20 @@
                         window.userPaused = true;
                         window.setAudioInterrupted(false);
                         savePlayingIntent(false);
+                        if (typeof _reconnectTimer !== 'undefined') clearTimeout(_reconnectTimer);
+                        if (typeof _recoverySafetyTimer !== 'undefined') clearTimeout(_recoverySafetyTimer);
+                        _isRecovering = false;
                         SilentCarrierAudio.stop();
                         RadioAudio.pause();
+                        audioPersistenceManager.saveAudioState();
                         window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
+                        window.hideReconnectingDialogue();
                         releasePlayerWakeLock();
+                        if ('mediaSession' in navigator) {
+                            try {
+                                navigator.mediaSession.playbackState = 'paused';
+                            } catch(e) {}
+                        }
                     });
                 } catch (e) {}
             }
@@ -1196,6 +1207,7 @@
 
             liveAudio.addEventListener('playing', function() {
                 _isRecovering = false;
+                SilentCarrierAudio.stop();
                 window.safeLocalStorage.setItem(window.getStationStorageKey('playing_intent_time'), Date.now().toString());
                 audioPersistenceManager.saveAudioState();
                 window.setPlayerState(window.PLAYER_STATE.PLAYING);
@@ -1208,12 +1220,17 @@
                 audioPersistenceManager.saveAudioState();
                 releasePlayerWakeLock();
 
-                // 1. Explicit user pause
+                // 1. Explicit user pause (from web button or lock screen)
                 if (window.userPaused) {
                     window.setAudioInterrupted(false);
+                    SilentCarrierAudio.stop();
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
-                    SilentCarrierAudio.stop();
+                    if ('mediaSession' in navigator) {
+                        try {
+                            navigator.mediaSession.playbackState = 'paused';
+                        } catch(e) {}
+                    }
                     return;
                 }
 
@@ -1237,6 +1254,7 @@
                 // 3. Network buffer starvation / cellular toggle in background:
                 // Keep SilentCarrierAudio running so iOS doesn't freeze the tab!
                 if (window.isIntentStillValid()) {
+                    SilentCarrierAudio.start();
                     var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
                     if (!isOnline) {
                         window.setPlayerState(window.PLAYER_STATE.RECONNECTING, "Waiting for network...");

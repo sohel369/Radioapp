@@ -1017,21 +1017,26 @@
                 return;
             }
 
-            // 3. Check if currentTime advances over 800ms (detects severed HTTP live socket in Chrome)
-            var sampleTime = audio.currentTime;
+            // 3. If audio is genuinely playing with active buffer, leave it completely undisturbed!
+            if (!audio.paused && audio.readyState >= 2 && !audio.error) {
+                window.setPlayerState(window.PLAYER_STATE.PLAYING);
+                return;
+            }
+
+            // 4. Check if stream remains dead after returning to foreground
             setTimeout(function() {
                 if (window.isIntentStillValid() && !window.isAudioInterrupted() && !window.userPaused) {
                     var currentAudio = RadioAudio.get();
                     if (currentAudio) {
-                        if (currentAudio.paused || currentAudio.readyState < 2 || currentAudio.currentTime === sampleTime) {
-                            console.warn('⚠️ [StreamHealth] Audio frozen/silent upon returning (' + source + ') — auto-recovering...');
-                            window.recoverLiveStream('foreground-frozen-time');
+                        if (currentAudio.paused || currentAudio.error || currentAudio.networkState === 3) {
+                            console.warn('⚠️ [StreamHealth] Audio dead upon returning (' + source + ') — auto-recovering...');
+                            window.recoverLiveStream('foreground-dead-stream');
                         } else {
                             window.setPlayerState(window.PLAYER_STATE.PLAYING);
                         }
                     }
                 }
-            }, 800);
+            }, 1000);
         };
 
         function attemptAutoResumeOnBack(reason) {

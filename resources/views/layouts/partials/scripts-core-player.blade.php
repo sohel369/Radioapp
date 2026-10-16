@@ -1016,10 +1016,9 @@
 
             if (_resumeOnGestureArmed) return;
 
-            // 1. If audio is paused and user intent is active, do NOT attempt to play the stale buffer!
-            // Live streams cannot be resumed from a dead socket. Mount a fresh live stream immediately:
+            // 1. If audio is paused, preserve the paused state so audio NEVER plays unexpectedly from the user's pocket!
             if (audio.paused) {
-                window.recoverLiveStream('foreground-' + source);
+                window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                 return;
             }
 
@@ -1040,14 +1039,15 @@
             setTimeout(function() {
                 if (window.isIntentStillValid() && !window.isAudioInterrupted() && !window.userPaused) {
                     var currentAudio = RadioAudio.get();
-                    if (currentAudio) {
-                        if (currentAudio.paused || currentAudio.error || currentAudio.networkState === 3) {
-                            console.warn('⚠️ [StreamHealth] Audio dead upon returning (' + source + ') — auto-recovering...');
+                    if (!currentAudio || currentAudio.paused) {
+                        return;
+                    }
+                        if (currentAudio.error || currentAudio.networkState === 3) {
+                            console.warn('⚠️ [StreamHealth] Audio stream error upon returning (' + source + ') — recovering...');
                             window.recoverLiveStream('foreground-dead-stream');
                         } else {
                             window.setPlayerState(window.PLAYER_STATE.PLAYING);
                         }
-                    }
                 }
             }, 1000);
         };

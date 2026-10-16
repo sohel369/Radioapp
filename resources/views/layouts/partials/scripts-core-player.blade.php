@@ -247,6 +247,9 @@
                     if (typeof window.verifyStreamHealthOnForeground === 'function') {
                         window.verifyStreamHealthOnForeground('visibilitychange');
                     }
+                    if (typeof handleAudioRouteChange === 'function' && window.isAudioInterrupted()) {
+                        handleAudioRouteChange('visibilitychange');
+                    }
                 }
             });
 
@@ -259,6 +262,9 @@
 
                 if (typeof window.verifyStreamHealthOnForeground === 'function') {
                     window.verifyStreamHealthOnForeground('focus');
+                }
+                if (typeof handleAudioRouteChange === 'function' && window.isAudioInterrupted()) {
+                    handleAudioRouteChange('focus');
                 }
             });
 
@@ -850,8 +856,8 @@
                     }
                 }
 
-                // If confirmed Bluetooth physical disconnect, only allow recovery if vehicle reconnected or user/mediasession action
-                if (intType === 'bluetooth' && (reason.indexOf('vehicle-reconnected') === -1 && reason.indexOf('user') === -1 && reason.indexOf('mediasession') === -1)) {
+                // If confirmed Bluetooth physical disconnect, only allow recovery if vehicle/device reconnected or user/mediasession action
+                if (intType === 'bluetooth' && (reason.indexOf('reconnect') === -1 && reason.indexOf('user') === -1 && reason.indexOf('mediasession') === -1)) {
                     window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
                     _isRecovering = false;
@@ -1220,32 +1226,14 @@
                     return;
                 }
 
-                // 2. Involuntary pause: check if this is an actual Bluetooth / CarPlay device disconnect
-                var timeSinceDisconnect = Date.now() - window.getLastAudioDisconnectTime();
-                var isDeviceDisconnect = window.audioInterruptedByDevice || (timeSinceDisconnect < 3000);
-
-                if (isDeviceDisconnect) {
-                    window.setAudioInterrupted(true, 'bluetooth');
-                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
-                    window.hideReconnectingDialogue();
-                    SilentCarrierAudio.stop();
-                    if ('mediaSession' in navigator) {
-                        try {
-                            navigator.mediaSession.playbackState = 'paused';
-                        } catch(e) {}
-                    }
-                    return;
-                }
-
-                // 3. System audio interruption (phone call, Siri, system prompt):
-                // On mobile (iOS / Android), when a call begins or rings, the OS forcibly pauses media.
-                // We MUST mark the interruption as 'call', pause playback cleanly, and NEVER attempt
-                // to restart or recover audio while the phone call is active!
+                // 2. Involuntary pause while online (leaving the car, Bluetooth disconnect, or phone call):
+                // We MUST mark it as interrupted ('bluetooth'), keep player strictly PAUSED,
+                // and NEVER play on the phone speaker from the user's pocket!
                 var isOnline = (typeof navigator.onLine === 'undefined') ? true : navigator.onLine;
                 if (isOnline && window.isIntentStillValid()) {
-                    console.log('📞 [SmartPlayer] Audio paused by OS (phone call or system interruption). Suspending playback during call.');
-                    window.setAudioInterrupted(true, 'call');
-                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Call in progress...");
+                    console.log('🔇 [SmartPlayer] Audio paused involuntarily while online (Bluetooth/Car disconnect or Call). Holding in PAUSED state.');
+                    window.setAudioInterrupted(true, 'bluetooth');
+                    window.setPlayerState(window.PLAYER_STATE.PAUSED, "Press Play To Listen");
                     window.hideReconnectingDialogue();
                     SilentCarrierAudio.stop();
                     if ('mediaSession' in navigator) {
@@ -1368,10 +1356,21 @@
             }
         });
 
-        // Intelligent route change & device tracking for iOS Safari / CarPlay
-        var _lastKnownAudioDeviceCount = null;
+        // Intelligent route change & device tracking for iOS Safari / CarPlay / Android
+        var _lastDeviceFingerprint = null;
         var _isCheckingRouteChange = false;
         var _resumeDebounceTimer = null;
+
+        function getAudioDeviceFingerprint(devices) {
+            if (!devices || !devices.length) return '';
+            var list = [];
+            for (var i = 0; i < devices.length; i++) {
+                if (devices[i].kind === 'audioinput' || devices[i].kind === 'audiooutput') {
+                    list.push((devices[i].kind || '') + ':' + (devices[i].deviceId || '') + ':' + (devices[i].groupId || '') + ':' + (devices[i].label || ''));
+                }
+            }
+            return list.join('|');
+        }
 
         function handleAudioRouteChange(source) {
             if (_isCheckingRouteChange) return;
@@ -1388,29 +1387,23 @@
 
             enumerate.then(function(devices) {
                 _isCheckingRouteChange = false;
-                var currentCount = 0;
-                for (var i = 0; i < devices.length; i++) {
-                    if (devices[i].kind === 'audioinput' || devices[i].kind === 'audiooutput') {
-                        currentCount++;
-                    }
-                }
+                var currentFingerprint = getAudioDeviceFingerprint(devices);
+                var prevFingerprint = _lastDeviceFingerprint;
+                _lastDeviceFingerprint = currentFingerprint;
 
-                var prevCount = _lastKnownAudioDeviceCount;
-                _lastKnownAudioDeviceCount = currentCount;
-                var now = Date.now();
-
-                if (prevCount === null) {
+                if (prevFingerprint === null && source === 'init') {
                     return; // Baseline established
                 }
 
+                var isRouteChanged = (source === 'devicechange') || (prevFingerprint !== null && currentFingerprint !== prevFingerprint);
+                var now = Date.now();
                 var isAudioActuallyPlaying = window.isRealAudioPlaying ? window.isRealAudioPlaying() : (!RadioAudio.paused());
 
                 // 1. DISCONNECT DETECTION:
-                // Audio device disconnected (currentCount < prevCount)
-                var isDisconnect = (currentCount < prevCount);
-
-                if (isDisconnect) {
+                // If audio is actively playing and a device route change occurs (e.g. bluetooth turned off, headphones unplugged):
+                if (isAudioActuallyPlaying && isRouteChanged) {
                     clearTimeout(_resumeDebounceTimer);
+                    _resumeDebounceTimer = null;
                     window.userPaused = false; // preserve intent to resume when reconnected
                     window.setAudioInterrupted(true, 'bluetooth');
                     SilentCarrierAudio.stop();
@@ -1425,24 +1418,23 @@
                     return;
                 }
 
-                // 2. RECONNECT / CALL END DETECTION:
-                // Reconnection to vehicle/headphones occurs when audio device count INCREASES, or when phone call ends
-                var isReconnect = (currentCount > prevCount);
-
-                if (window.isAudioInterrupted() && window.isIntentStillValid()) {
-                    var intType = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
-                    if (intType === 'call' || (isReconnect && intType === 'bluetooth')) {
+                // 2. RECONNECT DETECTION:
+                // If audio is currently paused & interrupted, and an audio device route change occurred (e.g. bluetooth turned on, vehicle reconnected):
+                if (window.isAudioInterrupted() && window.isIntentStillValid() && !window.userPaused && isRouteChanged) {
+                    var timeSinceDisconnect = now - window.getLastAudioDisconnectTime();
+                    // Debounce: ensure at least 600ms has elapsed since disconnect event
+                    if (timeSinceDisconnect >= 600) {
                         clearTimeout(_resumeDebounceTimer);
                         _resumeDebounceTimer = setTimeout(function() {
-                            if (window.isAudioInterrupted() && window.isIntentStillValid()) {
-                                var currentInt = window.safeLocalStorage.getItem(window.getStationStorageKey('interruption_type')) || '';
+                            if (window.isAudioInterrupted() && window.isIntentStillValid() && !window.userPaused) {
+                                console.log('🎧 [SmartPlayer] Audio device reconnected (' + source + ') — auto-resuming live playback.');
                                 window.setAudioInterrupted(false);
                                 window.userPaused = false;
                                 savePlayingIntent(true);
                                 SilentCarrierAudio.start();
-                                window.recoverLiveStream(currentInt === 'call' ? ('call-ended-' + source) : ('vehicle-reconnected-' + source));
+                                window.recoverLiveStream('device-reconnected-' + source);
                             }
-                        }, 1000);
+                        }, 800);
                     }
                 }
             }).catch(function(err) {
